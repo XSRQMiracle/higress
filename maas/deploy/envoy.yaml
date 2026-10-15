@@ -1,0 +1,155 @@
+# MaaS 网关（阶段 0）的静态 Envoy 配置，运行在 Higress gateway 镜像内（不依赖 K8s 与控制面）。
+#
+# 端口：
+#   10000  网关入口：请求经过 maas-scheduler 插件选择推理副本
+#   10001  对照组：纯 Envoy 轮询、不加载任何插件，相当于"K8s Service 直连多副本"的基线
+#   9901   Envoy admin（/stats、/clusters、/config_dump）
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: maas_gateway
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: maas_gateway
+                stream_idle_timeout: 300s
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                      log_format:
+                        text_format_source:
+                          inline_string: "[%START_TIME%] gateway \"%REQ(:METHOD)% %REQ(:PATH)%\" %RESPONSE_CODE% %RESPONSE_FLAGS% upstream=%UPSTREAM_HOST% picked=%RESP(X-MAAS-PICKED)% reason=%RESP(X-MAAS-REASON)% first_byte=%RESPONSE_DURATION%ms total=%DURATION%ms\n"
+                route_config:
+                  name: maas_gateway_route
+                  virtual_hosts:
+                    - name: maas
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: vllm
+                            timeout: 0s # Envoy 默认 15s 路由超时会截断长的流式响应
+                            idle_timeout: 300s
+                http_filters:
+                  - name: maas-scheduler
+                    typed_config:
+                      "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+                      type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      value:
+                        config:
+                          name: maas-scheduler
+                          vm_config:
+                            runtime: envoy.wasm.runtime.v8
+                            code:
+                              local:
+                                filename: /etc/envoy/plugins/maas-scheduler.wasm
+                          configuration:
+                            "@type": type.googleapis.com/google.protobuf.StringValue
+                            value: |
+                              {
+                                "policy": "least_waiting",
+                                "targetHeader": "x-maas-target",
+                                "debugHeaders": true,
+                                "debugPath": "/maas/debug/hosts"
+                              }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+    - name: baseline_round_robin
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10001 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: baseline_rr
+                stream_idle_timeout: 300s
+                route_config:
+                  name: baseline_rr_route
+                  virtual_hosts:
+                    - name: baseline
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route:
+                            cluster: vllm_round_robin
+                            timeout: 0s
+                            idle_timeout: 300s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # 推理副本集群。lb_policy 只在插件未做 override（fail-open）时生效。
+    - name: vllm
+      type: STRICT_DNS
+      connect_timeout: 2s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: vllm
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: mock-vllm-0, port_value: 8000 } } }
+              - endpoint: { address: { socket_address: { address: mock-vllm-1, port_value: 8000 } } }
+              - endpoint: { address: { socket_address: { address: mock-vllm-2, port_value: 8000 } } }
+      health_checks:
+        - timeout: 1s
+          interval: 0.5s
+          # 没有业务流量时 Envoy 默认 60s 才检查一次，这里保持同频，保证指标新鲜
+          no_traffic_interval: 0.5s
+          unhealthy_threshold: 2
+          healthy_threshold: 1
+          http_health_check:
+            path: /metrics
+          # Higress Envoy 扩展字段（HealthCheck 第 127 号字段）：保存健康检查响应体，
+          # 插件通过 proxywasm.GetUpstreamHosts() 读到每个副本最新的 /metrics 文本
+          store_metrics: true
+      circuit_breakers:
+        thresholds:
+          - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 10 }
+
+    # 对照组集群：同样的副本、同样的健康检查，但不存指标、不经过插件
+    - name: vllm_round_robin
+      type: STRICT_DNS
+      connect_timeout: 2s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: vllm_round_robin
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: mock-vllm-0, port_value: 8000 } } }
+              - endpoint: { address: { socket_address: { address: mock-vllm-1, port_value: 8000 } } }
+              - endpoint: { address: { socket_address: { address: mock-vllm-2, port_value: 8000 } } }
+      health_checks:
+        - timeout: 1s
+          interval: 0.5s
+          no_traffic_interval: 0.5s
+          unhealthy_threshold: 2
+          healthy_threshold: 1
+          http_health_check:
+            path: /health
+      circuit_breakers:
+        thresholds:
+          - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 10 }
+
+    # 阶段 1 的 maas-cache 会用到 Redis；集群名沿用 Higress 的 FQDN 命名规则 outbound|<port>||<fqdn>
+    - name: outbound|6379||redis.dns
+      type: STRICT_DNS
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: outbound|6379||redis.dns
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: redis, port_value: 6379 } } }
