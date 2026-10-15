@@ -29,7 +29,8 @@ run() {
 }
 
 run baseline-rr --url "$BASELINE" --mode closed --concurrency "$CONC"
-run gateway-least-waiting --url "$GATEWAY" --mode closed --concurrency "$CONC"
+# 网关入口加入 maas-cache 之后，用绕过请求头只测调度插件，保证与阶段 0 的结果可比
+run gateway-least-waiting --url "$GATEWAY" --mode closed --concurrency "$CONC" --header "x-maas-cache-bypass: on"
 run direct-single-replica --url "$DIRECT" --mode closed --concurrency $((CONC / 3))
 
 echo

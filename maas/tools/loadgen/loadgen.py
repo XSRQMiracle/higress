@@ -106,7 +106,9 @@ async def send_one(session: aiohttp.ClientSession, url: str, body: dict, headers
                     res.prompt_tokens = usage.get("prompt_tokens") or 0
                     res.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
                 for choice in event.get("choices") or []:
-                    text = (choice.get("delta") or {}).get("content") or choice.get("text")
+                    delta = choice.get("delta") or {}
+                    # 思考模型先输出 reasoning_content（部分 vLLM 版本字段名为 reasoning），同样计入首 token
+                    text = delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning") or choice.get("text")
                     if text:
                         now = time.perf_counter()
                         if res.ttft is None:
@@ -207,32 +209,51 @@ def describe(values: list[float], scale: float = 1.0) -> dict:
     }
 
 
+_GATEWAY_HITS = ("L1", "L2", "L3")
+
+# 分组：all 全部；hot / new 按负载类型；gw_hit / gw_miss 按是否命中网关缓存（x-maas-cache 响应头）
+_GROUPS = {
+    "all": lambda r: True,
+    "hot": lambda r: r.kind == "hot",
+    "new": lambda r: r.kind == "new",
+    "gw_hit": lambda r: r.cache in _GATEWAY_HITS,
+    "gw_miss": lambda r: r.cache not in _GATEWAY_HITS,
+}
+
+
 def summarize(args: argparse.Namespace, results: list[Result], itl: Reservoir, wall: float) -> dict:
     measured = [r for r in results if not r.warmup]
     ok = [r for r in measured if r.error is None]
     window = max((r.start + r.e2e for r in ok), default=args.warmup) - args.warmup
     window = window if window > 0 else max(wall - args.warmup, 1e-9)
     groups = {}
-    for name in ("all", "hot", "new"):
-        rows = ok if name == "all" else [r for r in ok if r.kind == name]
+    for name, member in _GROUPS.items():
+        rows = [r for r in ok if member(r)]
+        if name.startswith("gw_") and not any(r.cache for r in ok):
+            continue  # 没有经过 maas-cache（例如基线），不输出缓存分组
         groups[name] = {
-            "requests": len([r for r in measured if name == "all" or r.kind == name]),
+            "requests": len([r for r in measured if member(r)]),
             "ok": len(rows),
             "ttft_ms": describe([r.ttft for r in rows if r.ttft is not None], 1000),
             "tpot_ms": describe([r.tpot for r in rows if r.tpot is not None], 1000),
             "e2e_s": describe([r.e2e for r in rows if r.e2e is not None]),
             "output_tokens": sum(r.output_tokens for r in rows),
         }
-    prompt_tokens = sum(r.prompt_tokens for r in ok)
+    # 后端前缀缓存命中率只统计真正到达后端的请求（网关缓存命中的回放会把 cached_tokens 记为全部 prompt）
+    backend = [r for r in ok if r.cache not in _GATEWAY_HITS]
+    prompt_tokens = sum(r.prompt_tokens for r in backend)
+    gateway_hits = sum(1 for r in ok if r.cache in _GATEWAY_HITS)
     return {
-        "config": {k: v for k, v in vars(args).items() if k not in ("header",)},
+        # 请求头的值可能含鉴权信息，只记录名字
+        "config": {**{k: v for k, v in vars(args).items() if k != "header"}, "header_names": [h.split(":", 1)[0].strip() for h in args.header]},
         "wall_seconds": wall,
         "window_seconds": window,
         "throughput_rps": len(ok) / window,
         "output_tokens_per_s": groups["all"]["output_tokens"] / window,
         "error_count": len(measured) - len(ok),
         "errors": dict(Counter((r.error or "")[:80] for r in measured if r.error).most_common(5)),
-        "backend_prefix_cache_hit_rate": (sum(r.cached_tokens for r in ok) / prompt_tokens) if prompt_tokens else None,
+        "backend_prefix_cache_hit_rate": (sum(r.cached_tokens for r in backend) / prompt_tokens) if prompt_tokens else None,
+        "gateway_cache_hit_rate": gateway_hits / len(ok) if ok else None,
         "gateway_cache": dict(Counter(r.cache or "none" for r in ok)),
         "replicas": dict(sorted(Counter(r.replica or "unknown" for r in ok).items())),
         "scheduler_reasons": dict(Counter(r.reason or "none" for r in ok)),
@@ -250,17 +271,19 @@ def print_summary(summary: dict) -> None:
     cfg = summary["config"]
     load = f"concurrency={cfg['concurrency']}" if cfg["mode"] == "closed" else f"rate={cfg['rate']}/s"
     print(f"\n== {cfg['label'] or cfg['url']} | {cfg['mode']}-loop {load} | {cfg['duration']}s (+{cfg['warmup']}s warmup) ==")
-    print(f"{'group':<5} {'ok/req':>11}  {'TTFT p50/p90/p99 ms':>22}  {'TPOT mean/p50/p99 ms':>22}  {'E2E p99 s':>9}")
+    print(f"{'group':<7} {'ok/req':>11}  {'TTFT p50/p90/p99 ms':>22}  {'TPOT mean/p50/p99 ms':>22}  {'E2E p99 s':>9}")
     for name, g in summary["groups"].items():
         t, p, e = g["ttft_ms"], g["tpot_ms"], g["e2e_s"]
         print(
-            f"{name:<5} {g['ok']:>5}/{g['requests']:<5}  "
+            f"{name:<7} {g['ok']:>5}/{g['requests']:<5}  "
             f"{_fmt(t, 'p50'):>6} /{_fmt(t, 'p90'):>6} /{_fmt(t, 'p99'):>6}  "
             f"{_fmt(p, 'mean'):>6} /{_fmt(p, 'p50'):>6} /{_fmt(p, 'p99'):>6}  {_fmt(e, 'p99'):>9}"
         )
     hit = summary["backend_prefix_cache_hit_rate"]
+    gw_hit = summary["gateway_cache_hit_rate"]
     print(
         f"throughput {summary['throughput_rps']:.2f} req/s, {summary['output_tokens_per_s']:.0f} out tok/s | "
+        f"gateway cache hit {'-' if gw_hit is None else f'{gw_hit:.1%}'} | "
         f"backend prefix-cache hit {'-' if hit is None else f'{hit:.1%}'} | errors {summary['error_count']} {summary['errors'] or ''}"
     )
     print(f"replicas {summary['replicas']} | scheduler {summary['scheduler_reasons']} | gateway cache {summary['gateway_cache']}")

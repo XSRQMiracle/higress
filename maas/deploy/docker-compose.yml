@@ -1,4 +1,5 @@
-# MaaS 网关阶段 0：Higress gateway（静态 envoy.yaml + WASM 插件）+ 3 个 mock-vllm 副本 + Redis。
+# MaaS 网关：Higress gateway（静态 envoy.yaml + maas-cache / maas-scheduler 两个 WASM 插件）
+# + 3 个 mock-vllm 副本 + Redis（maas-cache 的 L2）。
 #
 #   cd maas/deploy && ./up.sh                  # 构建插件并启动
 #   docker compose run --rm loadgen ...        # 压测工具（profile: tools）
@@ -37,6 +38,7 @@ services:
       - "9901:9901"
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ../../plugins/wasm-go/extensions/maas-cache/main.wasm:/etc/envoy/plugins/maas-cache.wasm:ro
       - ../../plugins/wasm-go/extensions/maas-scheduler/main.wasm:/etc/envoy/plugins/maas-scheduler.wasm:ro
     depends_on: [mock-vllm-0, mock-vllm-1, mock-vllm-2, redis]
     restart: unless-stopped
