@@ -1,0 +1,4 @@
+# 压测逐请求明细体积较大，只提交 summary.json
+results/**/requests.jsonl
+__pycache__/
+.venv/
