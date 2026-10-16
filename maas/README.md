@@ -1,14 +1,28 @@
 # MaaS 智能路由与多级缓存网关（赛题七）
 
-基于 Higress 二次开发的 MaaS 网关。本目录放部署配置、仿真后端与压测工具；网关插件位于 [`plugins/wasm-go/extensions/maas-*`](../plugins/wasm-go/extensions/maas-scheduler/README.md)。
+基于 Higress 二次开发的 MaaS 网关。本目录放部署配置、仿真后端与压测工具；网关插件位于 `plugins/wasm-go/extensions/`：
 
-## 当前进度：阶段 0（链路打通）
+- [maas-cache](../plugins/wasm-go/extensions/maas-cache/README.md)：多级响应缓存（L1 进程内 W-TinyLFU + L2 Redis），按 vLLM 格式原样回放
+- [maas-scheduler](../plugins/wasm-go/extensions/maas-scheduler/README.md)：推理副本调度（当前为能力验证版 + least_waiting 策略）
+
+请求链路：`client → maas-cache →（未命中）→ maas-scheduler → vLLM 副本`。
+
+## 当前进度
+
+阶段 0（链路打通）：
 
 - [x] docker-compose 一键启动：Higress gateway（静态 envoy.yaml + WASM 插件）+ 3 个 mock-vllm 副本 + Redis
 - [x] mock-vllm：模拟 vLLM 的连续批处理、chunked prefill、KV block 池、前缀缓存、抢占，暴露同名 `/metrics`，支持故障注入
 - [x] maas-scheduler（能力验证版）：验证 `GetUpstreamHosts` + `store_metrics`、`SetUpstreamOverrideHost`
 - [x] loadgen：50% 热点 + 50% 新请求的合成负载，开环 / 闭环，输出 TTFT / TPOT / ITL 分位数
 - [x] 自动验证脚本与基线压测脚本
+
+阶段 1（多级缓存）：
+
+- [x] maas-cache：完整请求规范化缓存键、L1 W-TinyLFU（可切换 LRU 对照）+ L2 Redis、按原始 token 分块回放、流式 / 非流式互转、不可缓存请求过滤、故障放行
+- [x] loadgen 按"网关缓存命中 / 未命中"分组统计，思考模型的 reasoning token 计入首 token
+- [x] 阶段 1 自动验证（`verify_phase1.py`）与压测（`phase1_bench.sh`）
+- [ ] L3 语义缓存、缓存 epoch 失效接口、并发未命中合并（后续）
 
 ## 目录
 
@@ -21,7 +35,7 @@ maas/
 ├── tools/
 │   ├── mock-vllm/           # vLLM 模拟器（Python + aiohttp）
 │   └── loadgen/             # 压测（loadgen.py）、负载生成（workload.py）、对比（compare.py）、
-│                            # 阶段 0 验证（verify_phase0.py）、基线压测（phase0_bench.sh）
+│                            # 各阶段验证（verify_phase*.py）与压测脚本（phase*_bench.sh）
 └── results/                 # 压测结果（只提交 summary.json）
 ```
 
@@ -37,11 +51,11 @@ cd maas/deploy && ./up.sh
 
 | 端口 | 说明 |
 |---|---|
-| 10000 | 网关入口，经过 maas-scheduler |
+| 10000 | 网关入口：maas-cache → maas-scheduler；请求头 `x-maas-cache-bypass: on` 可跳过缓存 |
 | 10001 | 基线：纯 Envoy 轮询，不加载插件（相当于 K8s Service 直连多副本） |
 | 8001–8003 | 直连 mock-vllm-0/1/2（含 `/admin/*` 故障注入接口） |
 | 9901 | Envoy admin |
-| 6379 | Redis（阶段 1 缓存使用） |
+| 6379 | Redis（maas-cache 的 L2） |
 
 验证 store_metrics、OverrideHost、副本下线剔除与慢节点分流：
 
@@ -52,11 +66,19 @@ uv run --with aiohttp python verify_phase0.py
 cd maas/deploy && docker compose run --rm loadgen verify_phase0.py --gateway http://gateway:10000 --admin-template 'http://{replica}:8000'
 ```
 
-基线压测（纯轮询 vs 网关，外加单副本直连参考）：
+验证缓存的命中、回放保真度、缓存键正确性与故障放行（`--docker-checks` 会重启网关、临时停掉 Redis）：
 
 ```bash
 cd maas/tools/loadgen
-PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase0_bench.sh
+uv run --with aiohttp python verify_phase1.py --docker-checks
+```
+
+压测（每轮开始前清空副本前缀缓存与网关缓存）：
+
+```bash
+cd maas/tools/loadgen
+PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase0_bench.sh   # 纯轮询 vs 调度插件（绕过缓存）
+PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase1_bench.sh   # 加入缓存后的闭环 / 开环对比，约 18 分钟
 # 决赛口径：DURATION=600
 ```
 
@@ -87,6 +109,41 @@ PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase0_bench.sh
 - 下一步的收益点：阶段 2 的前缀亲和把同一文档固定到同一副本，冷 prefill 理论上从 24 次降到 8 次；阶段 1 的响应缓存让热点请求直接绕过后端。
 
 原始数据：`maas/results/phase0/*/summary.json`（逐请求明细 `requests.jsonl` 不入库，重跑脚本即可生成）。
+
+## 阶段 1 结果
+
+### 功能验证（`verify_phase1.py --docker-checks`，全部通过）
+
+| 检查项 | 结果 |
+|---|---|
+| 命中与回放保真度 | 第二次请求命中 L1；回放的 SSE 事件数（27）、内容分块、finish_reason、usage、model 与原始响应完全一致 |
+| 首字节时间 | 命中 3ms，未命中 108ms |
+| 流式 ↔ 非流式 | 同一条缓存可以回放成非流式 JSON，内容一致 |
+| 缓存键 | 字段顺序不同、带 `user` 字段的等价请求命中；system prompt、temperature、max_tokens 不同则未命中 |
+| 不可缓存请求 | `n=2`、`logprobs` 直接放行（`skip:n` / `skip:logprobs`）；带绕过请求头的请求由后端处理 |
+| L2 | 重启网关清空所有 worker 的 L1 后，从 Redis 命中，内容一致 |
+| Redis 故障 | 停掉 Redis 期间请求全部返回 200，只会未命中或命中本 worker 的 L1 |
+
+### 压测（`phase1_bench.sh`，mock 后端，180s + 30s 预热）
+
+负载与阶段 0 相同：50% 热点 + 50% 新请求，10% 的请求附带 8K token 文档。
+
+| 负载模型 | 配置 | TTFT P50 / P90 / P99 | TPOT 均值 | 吞吐 | 网关缓存命中 | 后端前缀命中 |
+|---|---|---|---|---|---|---|
+| 闭环，并发 48 | 纯轮询 | 65 / 449 / 1222 ms | 34.0 ms | 7.98 req/s | — | 83.2% |
+| | 只调度（绕过缓存） | 65 / 85 / 1202 ms | 32.6 ms | 8.38 req/s | — | 83.0% |
+| | 缓存 + 调度 | 55 / 77 / 1202 ms | 19.1 ms | 13.90 req/s | 43.9% | 64.2% |
+| 开环，16 req/s | 纯轮询 | 84 / 1159 / 1873 ms | 55.1 ms | 15.38 req/s | — | 83.0% |
+| | 缓存 + 调度 | 52 / 86 / 1227 ms | 19.3 ms | 15.44 req/s | 45.5% | 66.9% |
+
+命中缓存的请求 TTFT P99 约 10ms，TPOT 约为 0。按决赛口径（相对纯轮询基线）：
+
+- **开环**：P99 TTFT 提升 34.5%，平均 TPOT 提升 65.1%，达到"卓越"档。缓存挡掉约 45% 的请求，后端负载随之下降，未命中请求的 TPOT 也从 55ms 降到 35ms。
+- **闭环**：吞吐提升 74%，平均 TPOT 提升 43.8%，但 P99 TTFT 只提升 1.7%，达不到基础档。命中的请求几乎不耗时，虚拟用户立刻发出下一个请求，后端的在途请求数不变，而且全是新请求：后端前缀命中率从 83% 降到 64%，未命中请求的 TTFT P90 从 449ms 升到 614ms。P99 仍由长文档的冷 prefill（约 1.2s）决定。
+
+结论：决赛压测如果按固定 QPS 发请求，缓存已经能拿到高分；如果按固定并发，必须靠阶段 2 的前缀亲和与准入控制降低未命中请求的尾延迟。压测模型需要尽快向出题方确认。
+
+原始数据：`maas/results/phase1/*/summary.json`。
 
 ## mock-vllm
 

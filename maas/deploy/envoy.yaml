@@ -1,7 +1,8 @@
 # MaaS 网关（阶段 0）的静态 Envoy 配置，运行在 Higress gateway 镜像内（不依赖 K8s 与控制面）。
 #
 # 端口：
-#   10000  网关入口：请求经过 maas-scheduler 插件选择推理副本
+#   10000  网关入口：maas-cache（多级缓存）→ maas-scheduler（选择推理副本）
+#          带 x-maas-cache-bypass: on 时跳过缓存，相当于只有调度插件的网关
 #   10001  对照组：纯 Envoy 轮询、不加载任何插件，相当于"K8s Service 直连多副本"的基线
 #   9901   Envoy admin（/stats、/clusters、/config_dump）
 admin:
@@ -26,7 +27,7 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
                       log_format:
                         text_format_source:
-                          inline_string: "[%START_TIME%] gateway \"%REQ(:METHOD)% %REQ(:PATH)%\" %RESPONSE_CODE% %RESPONSE_FLAGS% upstream=%UPSTREAM_HOST% picked=%RESP(X-MAAS-PICKED)% reason=%RESP(X-MAAS-REASON)% first_byte=%RESPONSE_DURATION%ms total=%DURATION%ms\n"
+                          inline_string: "[%START_TIME%] gateway \"%REQ(:METHOD)% %REQ(:PATH)%\" %RESPONSE_CODE% %RESPONSE_FLAGS% cache=%RESP(X-MAAS-CACHE)% upstream=%UPSTREAM_HOST% picked=%RESP(X-MAAS-PICKED)% reason=%RESP(X-MAAS-REASON)% first_byte=%RESPONSE_DURATION%ms total=%DURATION%ms\n"
                 route_config:
                   name: maas_gateway_route
                   virtual_hosts:
@@ -39,6 +40,28 @@ static_resources:
                             timeout: 0s # Envoy 默认 15s 路由超时会截断长的流式响应
                             idle_timeout: 300s
                 http_filters:
+                  # 缓存放在调度之前：命中的请求直接回放，不占用调度与后端资源
+                  - name: maas-cache
+                    typed_config:
+                      "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+                      type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      value:
+                        config:
+                          name: maas-cache
+                          vm_config:
+                            runtime: envoy.wasm.runtime.v8
+                            code:
+                              local:
+                                filename: /etc/envoy/plugins/maas-cache.wasm
+                          configuration:
+                            "@type": type.googleapis.com/google.protobuf.StringValue
+                            value: |
+                              {
+                                "namespace": "mock-qwen@phase1",
+                                "l1": {"policy": "tinylfu", "capacity": 4096},
+                                "l2": {"serviceName": "redis.dns", "servicePort": 6379, "timeoutMs": 200, "ttlSeconds": 3600},
+                                "debugHeaders": true
+                              }
                   - name: maas-scheduler
                     typed_config:
                       "@type": type.googleapis.com/udpa.type.v1.TypedStruct
@@ -143,7 +166,7 @@ static_resources:
         thresholds:
           - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 10 }
 
-    # 阶段 1 的 maas-cache 会用到 Redis；集群名沿用 Higress 的 FQDN 命名规则 outbound|<port>||<fqdn>
+    # maas-cache 的 L2 缓存；集群名沿用 Higress 的 FQDN 命名规则 outbound|<port>||<fqdn>
     - name: outbound|6379||redis.dns
       type: STRICT_DNS
       connect_timeout: 1s
