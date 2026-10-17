@@ -125,13 +125,24 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(engine.pool.num_free, 64)
 
 
+class MetricsTest(unittest.TestCase):
+    def test_kv_usage_offset_only_affects_reported_usage(self):
+        engine = make_engine()
+        engine.fault.update({"kv_usage_offset": 0.95})
+        text = engine.render_metrics()
+        self.assertIn("vllm:kv_cache_usage_perc{", text)
+        reported = [line for line in text.splitlines() if line.startswith("vllm:kv_cache_usage_perc{")][0]
+        self.assertAlmostEqual(float(reported.rsplit(" ", 1)[1]), 0.95)
+        self.assertEqual(engine.pool.num_free, 64)
+
+
 class FaultConfigTest(unittest.TestCase):
     def test_update_validates_types(self):
         fault = FaultConfig()
         fault.update({"slow_factor": 3, "down": True})
         self.assertEqual(fault.slow_factor, 3.0)
         self.assertTrue(fault.down)
-        for bad in ({"error_rate": 2}, {"down": "yes"}, {"unknown": 1}, {"slow_factor": -1}):
+        for bad in ({"error_rate": 2}, {"down": "yes"}, {"unknown": 1}, {"slow_factor": -1}, {"kv_usage_offset": 1.5}):
             with self.assertRaises(ValueError):
                 FaultConfig().update(bad)
 
