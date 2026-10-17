@@ -21,6 +21,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 from collections import Counter
@@ -130,7 +131,22 @@ async def send_one(session: aiohttp.ClientSession, url: str, body: dict, headers
         res.error = f"{type(exc).__name__}: {exc}"[:160]
 
 
-async def run(args: argparse.Namespace, workload: Workload) -> tuple[list[Result], Reservoir, float]:
+_METRIC_LINE = re.compile(r"^(maas_[a-zA-Z0-9_]*)(?:\{[^}]*\})?\s+(\S+)$")
+
+
+async def gateway_metrics(session: aiohttp.ClientSession, admin: str) -> dict[str, float]:
+    """读取网关插件的自定义指标（Envoy admin 的 /stats/prometheus 中 maas_ 开头的序列，同名求和）。"""
+    async with session.get(admin.rstrip("/") + "/stats/prometheus") as resp:
+        text = await resp.text()
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        m = _METRIC_LINE.match(line)
+        if m and not m.group(1).endswith("_bucket"):
+            out[m.group(1)] = out.get(m.group(1), 0.0) + float(m.group(2))
+    return out
+
+
+async def run(args: argparse.Namespace, workload: Workload) -> tuple[list[Result], Reservoir, float, dict]:
     url = args.url.rstrip("/") + args.endpoint
     headers = dict(h.split(":", 1) for h in args.header)
     headers = {k.strip(): v.strip() for k, v in headers.items()}
@@ -139,6 +155,7 @@ async def run(args: argparse.Namespace, workload: Workload) -> tuple[list[Result
     timeout = aiohttp.ClientTimeout(total=args.timeout)
     connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        before = await gateway_metrics(session, args.admin) if args.admin else {}
         t_start = time.perf_counter()
         deadline = t_start + args.warmup + args.duration
         budget = args.num_requests or math.inf
@@ -181,10 +198,15 @@ async def run(args: argparse.Namespace, workload: Workload) -> tuple[list[Result
             if pending:
                 await asyncio.wait(pending, timeout=args.timeout)
         wall = time.perf_counter() - t_start
+        delta = {}
+        if args.admin:
+            await asyncio.sleep(5.5)  # Envoy 每 5 秒汇总一次直方图
+            after = await gateway_metrics(session, args.admin)
+            delta = {k: round(v - before.get(k, 0.0), 3) for k, v in sorted(after.items()) if v != before.get(k, 0.0)}
     for res in results:
         if res.error is None and res.e2e is None:
             res.error = "unfinished"
-    return results, itl, wall
+    return results, itl, wall, delta
 
 
 def percentile(values: list[float], p: float) -> float | None:
@@ -221,7 +243,7 @@ _GROUPS = {
 }
 
 
-def summarize(args: argparse.Namespace, results: list[Result], itl: Reservoir, wall: float) -> dict:
+def summarize(args: argparse.Namespace, results: list[Result], itl: Reservoir, wall: float, gateway: dict) -> dict:
     measured = [r for r in results if not r.warmup]
     ok = [r for r in measured if r.error is None]
     window = max((r.start + r.e2e for r in ok), default=args.warmup) - args.warmup
@@ -259,6 +281,8 @@ def summarize(args: argparse.Namespace, results: list[Result], itl: Reservoir, w
         "scheduler_reasons": dict(Counter(r.reason or "none" for r in ok)),
         "itl_ms": describe(itl.samples, 1000),
         "groups": groups,
+        # 整轮（含预热）网关插件指标的增量，需要 --admin
+        "gateway_metrics": gateway,
     }
 
 
@@ -287,6 +311,17 @@ def print_summary(summary: dict) -> None:
         f"backend prefix-cache hit {'-' if hit is None else f'{hit:.1%}'} | errors {summary['error_count']} {summary['errors'] or ''}"
     )
     print(f"replicas {summary['replicas']} | scheduler {summary['scheduler_reasons']} | gateway cache {summary['gateway_cache']}")
+    m = summary.get("gateway_metrics") or {}
+    if m.get("maas_cache_l3_lookups_total"):
+        lookup_ms = m.get("maas_cache_l3_lookup_ms_sum", 0) / max(m.get("maas_cache_l3_lookup_ms_count", 0), 1)
+        print(
+            f"L3: lookups {m['maas_cache_l3_lookups_total']:.0f}, hits {m.get('maas_cache_hits_l3_total', 0):.0f}, "
+            f"guard rejects {m.get('maas_cache_l3_rejects_total', 0):.0f}, errors {m.get('maas_cache_l3_errors_total', 0):.0f}, "
+            f"mean lookup {lookup_ms:.1f} ms"
+        )
+    pools = {k[len("maas_router_pool_"):-len("_total")]: int(v) for k, v in m.items() if k.startswith("maas_router_pool_")}
+    if pools:
+        print(f"router pools {pools}")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -305,6 +340,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--itl-samples", type=int, default=200000)
     parser.add_argument("--header", action="append", default=[], help="附加请求头，格式 'name: value'，可重复")
     parser.add_argument("--out", default="", help="输出目录：写入 requests.jsonl 与 summary.json")
+    parser.add_argument("--admin", default="", help="网关 Envoy admin 地址（如 http://localhost:9901），记录本轮插件指标的增量")
     for f in fields(WorkloadConfig):
         flag = "--" + f.name.replace("_", "-")
         if f.type in ("bool", bool):
@@ -318,8 +354,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None) -> None:
     args = parse_args(argv)
     workload = Workload(WorkloadConfig(**{f.name: getattr(args, f.name) for f in fields(WorkloadConfig)}))
-    results, itl, wall = asyncio.run(run(args, workload))
-    summary = summarize(args, results, itl, wall)
+    results, itl, wall, gateway = asyncio.run(run(args, workload))
+    summary = summarize(args, results, itl, wall, gateway)
     print_summary(summary)
     if args.out:
         os.makedirs(args.out, exist_ok=True)

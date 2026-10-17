@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(cd ../.. && pwd)
-PLUGINS=(maas-cache maas-scheduler)
+PLUGINS=(maas-cache maas-router maas-scheduler)
 
 for plugin in "${PLUGINS[@]}"; do
   dir="$ROOT/plugins/wasm-go/extensions/$plugin"

@@ -2,3 +2,4 @@
 results/**/requests.jsonl
 __pycache__/
 .venv/
+results/**/*.log

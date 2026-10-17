@@ -1,7 +1,7 @@
 # MaaS 网关（阶段 0）的静态 Envoy 配置，运行在 Higress gateway 镜像内（不依赖 K8s 与控制面）。
 #
 # 端口：
-#   10000  网关入口：maas-cache（多级缓存）→ maas-scheduler（选择推理副本，默认 cost 策略）
+#   10000  网关入口：maas-cache（L1/L2/L3 缓存）→ maas-router（语义分发到模型池）→ maas-scheduler（选择推理副本）
 #          消融实验：x-maas-cache-bypass: on 跳过缓存；x-maas-policy: least_waiting|round_robin|cost 临时切换调度策略
 #   10001  对照组：纯 Envoy 轮询、不加载任何插件，相当于"K8s Service 直连多副本"的基线
 #   9901   Envoy admin（/stats、/clusters、/config_dump）
@@ -34,6 +34,16 @@ static_resources:
                     - name: maas
                       domains: ["*"]
                       routes:
+                        # maas-router 按语义选定模型池后写入 x-maas-pool，Higress 在请求头变化后会重新匹配路由
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: x-maas-pool
+                                string_match: { exact: small }
+                          route:
+                            cluster: vllm_small
+                            timeout: 0s
+                            idle_timeout: 300s
                         - match: { prefix: "/" }
                           route:
                             cluster: vllm
@@ -60,7 +70,59 @@ static_resources:
                                 "namespace": "mock-qwen@phase1",
                                 "l1": {"policy": "tinylfu", "capacity": 4096},
                                 "l2": {"serviceName": "redis.dns", "servicePort": 6379, "timeoutMs": 200, "ttlSeconds": 3600},
+                                "l3": {
+                                  "embedding": {"serviceName": "embedder.dns", "servicePort": 8080, "model": "bge-small-zh-v1.5", "timeoutMs": 100},
+                                  "vector": {"serviceName": "qdrant.dns", "servicePort": 6333, "collection": "maas_semantic_cache", "timeoutMs": 100},
+                                  "threshold": 0.88,
+                                  "candidates": 3,
+                                  "maxQuestionChars": 512,
+                                  "guard": {
+                                    "numbers": true,
+                                    "negation": true,
+                                    "keyTerms": [
+                                      ["工商银行", "工行"], ["建设银行", "建行"], ["农业银行", "农行"], ["中国银行", "中行"], ["交通银行", "交行"], ["招商银行", "招行"],
+                                      ["邮储银行", "邮政储蓄"], "人民币", "美元", "欧元", "日元", "英镑", "港币", "澳元", ["借记卡", "储蓄卡"], "信用卡", "存款", "贷款",
+                                      ["房贷", "房屋贷款", "住房贷款"], "车贷", "消费贷", ["公积金贷款", "公积金"], ["商业贷款", "商贷"], "个人账户", ["对公账户", "企业账户"],
+                                      "支付宝", "微信", "云闪付", "开通", ["关闭", "注销", "取消"], "绑定", "解绑", "冻结", "解冻", "开门", "关门", "成功", "失败",
+                                      ["提高", "提额", "上调"], ["降低", "降额", "下调"], ["买入", "申购", "购买"], ["赎回", "卖出"]
+                                    ]
+                                  }
+                                },
                                 "debugHeaders": true
+                              }
+                  # 语义分发：model 为 higress/auto 时按问题语义选择模型池（改写 model 字段并写入 x-maas-pool）
+                  - name: maas-router
+                    typed_config:
+                      "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+                      type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      value:
+                        config:
+                          name: maas-router
+                          vm_config:
+                            runtime: envoy.wasm.runtime.v8
+                            code:
+                              local:
+                                filename: /etc/envoy/plugins/maas-router.wasm
+                          configuration:
+                            "@type": type.googleapis.com/google.protobuf.StringValue
+                            value: |
+                              {
+                                "autoModel": "higress/auto",
+                                "poolHeader": "x-maas-pool",
+                                "defaultPool": "large",
+                                "pools": [
+                                  {"name": "large", "model": "mock-qwen"},
+                                  {"name": "small", "model": "mock-qwen-small"}
+                                ],
+                                "longPromptTokens": 2000,
+                                "embedding": {"serviceName": "embedder.dns", "servicePort": 8080, "model": "bge-small-zh-v1.5", "timeoutMs": 100},
+                                "minSimilarity": 0.55,
+                                "classes": [
+                                  {"name": "chitchat", "pool": "small", "examples": ["你好", "谢谢你的帮助", "在吗", "你是谁", "早上好，今天天气不错"]},
+                                  {"name": "faq", "pool": "small", "examples": ["信用卡逾期了怎么办", "怎么修改手机银行的登录密码", "转账限额是多少", "银行网点几点开门", "如何开通短信提醒服务"]},
+                                  {"name": "analysis", "pool": "large", "examples": ["请分析这份财报中的主要风险点", "比较这两款理财产品的收益和风险并给出建议", "根据下面的合同条款判断是否存在违约风险", "帮我写一段 Python 代码计算复利", "解释利率上升为什么会导致债券价格下跌，并举例说明"]}
+                                ],
+                                "rules": [{"pattern": "(?i)(代码|python|sql|推导|step by step)", "pool": "large"}]
                               }
                   - name: maas-scheduler
                     typed_config:
@@ -172,6 +234,50 @@ static_resources:
       circuit_breakers:
         thresholds:
           - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 10 }
+
+    # 小模型池（语义分发的目标之一），同样开启 store_metrics 供调度插件使用
+    - name: vllm_small
+      type: STRICT_DNS
+      connect_timeout: 2s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: vllm_small
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: mock-vllm-small, port_value: 8000 } } }
+      health_checks:
+        - timeout: 1s
+          interval: 0.5s
+          no_traffic_interval: 0.5s
+          unhealthy_threshold: 2
+          healthy_threshold: 1
+          http_health_check:
+            path: /metrics
+          store_metrics: true
+      circuit_breakers:
+        thresholds:
+          - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 10 }
+
+    # 向量化服务与向量库（L3 语义缓存、语义分发），插件通过 DispatchHttpCall 访问
+    - name: outbound|8080||embedder.dns
+      type: STRICT_DNS
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: outbound|8080||embedder.dns
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: embedder, port_value: 8080 } } }
+
+    - name: outbound|6333||qdrant.dns
+      type: STRICT_DNS
+      connect_timeout: 1s
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: outbound|6333||qdrant.dns
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: qdrant, port_value: 6333 } } }
 
     # maas-cache 的 L2 缓存；集群名沿用 Higress 的 FQDN 命名规则 outbound|<port>||<fqdn>
     - name: outbound|6379||redis.dns

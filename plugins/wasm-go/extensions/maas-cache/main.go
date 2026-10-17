@@ -1,14 +1,15 @@
-// maas-cache：MaaS 网关的多级响应缓存插件（阶段 1：精确匹配缓存）。
+// maas-cache：MaaS 网关的多级响应缓存插件（阶段 1 精确匹配 + 阶段 3 语义缓存）。
 //
 // 请求路径：
 //  1. 只处理配置的 OpenAI 兼容接口（默认 /v1/chat/completions、/v1/completions）的 POST 请求；
 //  2. 读取请求体，过滤不可缓存的请求（n>1、logprobs、temperature 超过上限等），
 //     对"规范化后的完整请求"计算缓存键（见 key.go）；
-//  3. 依次查询 L1（本 worker 内的 W-TinyLFU，见 l1 包）与 L2（Redis）。命中则按 vLLM 的响应格式
-//     直接回放（见 entry.go），请求不再经过调度插件和推理后端；
-//  4. 未命中则放行。响应在原样透传给客户端的同时被收集，完整且成功结束时写入 L1 与 L2。
+//  3. 依次查询 L1（本 worker 内的 W-TinyLFU，见 l1 包）、L2（Redis）与 L3（语义匹配，见 semantic.go）。
+//     命中则按 vLLM 的响应格式直接回放（见 entry.go），请求不再经过分发、调度插件和推理后端；
+//  4. 未命中则放行。响应在原样透传给客户端的同时被收集，完整且成功结束时写入 L1 与 L2，
+//     并把问题向量登记到向量库。
 //
-// Redis 不可用、请求或响应不符合缓存条件时一律放行，缓存故障不会影响请求本身。
+// Redis、embedder、向量库不可用，请求或响应不符合缓存条件时一律放行，缓存故障不会影响请求本身。
 package main
 
 import (
@@ -36,6 +37,7 @@ const (
 	statusBypass  = "bypass"
 	statusL1      = "L1"
 	statusL2      = "L2"
+	statusL3      = "L3" // 语义命中
 )
 
 // requestState 记录单个请求在缓存插件中的处理状态。
@@ -44,12 +46,20 @@ type requestState struct {
 	key          string
 	stream       bool
 	includeUsage bool
-	status       string // pending | miss | bypass | skip:<原因> | L1 | L2
+	status       string // pending | miss | bypass | skip:<原因> | L1 | L2 | L3
 	collector    *collector
+	startedAt    time.Time
+	// L3 语义缓存
+	question       string
+	ctxKey         string
+	embedding      string // 问题向量（JSON 数组），未命中时在写缓存后登记到向量库
+	semanticScore  float64
+	semanticReject string // 相似度达标、但没通过要素校验的原因（number / negation / term）
+	skipSemantic   bool
 }
 
 func (s *requestState) hit() bool {
-	return s.status == statusL1 || s.status == statusL2
+	return s.status == statusL1 || s.status == statusL2 || s.status == statusL3
 }
 
 var idSource = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -80,15 +90,17 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		ctx.DontReadResponseBody()
 		return types.ActionContinue
 	}
-	state := &requestState{kind: kind, status: statusPending}
+	state := &requestState{kind: kind, status: statusPending, startedAt: time.Now()}
 	ctx.SetContext(ctxStateKey, state)
-	if bypassRequested(config) {
+	if bypassRequested(config.bypassHeaders) {
 		state.status = statusBypass
 		config.metrics.bypass.Increment(1)
 		ctx.DontReadRequestBody()
 		ctx.DontReadResponseBody()
 		return types.ActionContinue
 	}
+	// 只跳过 L3（仍查写 L1/L2），用于消融实验
+	state.skipSemantic = config.l3 != nil && bypassRequested(config.l3.bypassHeaders)
 	if length := contentLength(); length <= 0 || length > config.maxRequestBodyBytes {
 		ctx.DontReadRequestBody()
 		skip(ctx, config, state, "body_size")
@@ -124,6 +136,11 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	state.stream = req.Get("stream").Bool()
 	state.includeUsage = req.Get("stream_options.include_usage").Bool()
 	config.metrics.lookups.Increment(1)
+	question, ctxKey, semantic := semanticCandidate(config, state.kind, body, req)
+	semantic = semantic && !state.skipSemantic
+	if semantic {
+		state.question, state.ctxKey = question, ctxKey
+	}
 
 	if config.l1 != nil {
 		if entry, ok := config.l1.Get(key); ok {
@@ -141,6 +158,10 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 				config.l1.Put(key, entry)
 			}
 			replay(config, state, entry, statusL2)
+			return
+		}
+		// 精确匹配未命中：尝试 L3 语义匹配（异步链结束时自行回放或放行）
+		if semantic && lookupSemantic(config, state) {
 			return
 		}
 		miss(config, state)
@@ -162,6 +183,10 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config Config) types.Action 
 	}
 	if config.debugHeaders {
 		_ = proxywasm.AddHttpResponseHeader("x-maas-cache", state.status)
+		if state.semanticReject != "" {
+			_ = proxywasm.AddHttpResponseHeader("x-maas-semantic-reject", state.semanticReject)
+			_ = proxywasm.AddHttpResponseHeader("x-maas-semantic-score", strconv.FormatFloat(state.semanticScore, 'f', 4, 64))
+		}
 	}
 	if state.status != statusMiss {
 		ctx.DontReadResponseBody()
@@ -200,6 +225,9 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config Config, chunk [
 			proxywasm.LogDebugf("[%s] response not cached: %s", pluginName, reason)
 		} else {
 			store(config, state.key, entry)
+			if state.embedding != "" {
+				upsertSemantic(config, state)
+			}
 		}
 	}
 	return chunk
@@ -254,12 +282,19 @@ func replay(config Config, state *requestState, entry *Entry, level string) {
 	headers := [][2]string{{"content-type", contentType}}
 	if config.debugHeaders {
 		headers = append(headers, [2]string{"x-maas-cache", level})
+		if level == statusL3 {
+			headers = append(headers, [2]string{"x-maas-semantic-score", strconv.FormatFloat(state.semanticScore, 'f', 4, 64)})
+		}
 	}
-	if level == statusL1 {
+	switch level {
+	case statusL1:
 		config.metrics.hitL1.Increment(1)
-	} else {
+	case statusL2:
 		config.metrics.hitL2.Increment(1)
+	case statusL3:
+		config.metrics.hitL3.Increment(1)
 	}
+	config.metrics.hitLatencyMs.Record(uint64(time.Since(state.startedAt).Milliseconds()))
 	_ = proxywasm.SendHttpResponseWithDetail(200, pluginName+".hit", headers, body, -1)
 }
 
@@ -317,8 +352,8 @@ func skip(ctx wrapper.HttpContext, config Config, state *requestState, reason st
 	ctx.DontReadResponseBody()
 }
 
-func bypassRequested(config Config) bool {
-	for _, name := range config.bypassHeaders {
+func bypassRequested(headers []string) bool {
+	for _, name := range headers {
 		value, _ := proxywasm.GetHttpRequestHeader(name)
 		switch strings.ToLower(strings.TrimSpace(value)) {
 		case "on", "true", "1":
@@ -363,12 +398,13 @@ type debugResponse struct {
 	Entries   int    `json:"entries"`
 	Stats     any    `json:"stats,omitempty"`
 	L2Enabled bool   `json:"l2_enabled"`
+	L3Enabled bool   `json:"l3_enabled"`
 	Note      string `json:"note"`
 }
 
 // serveDebug 返回处理本请求的 worker 的 L1 状态（每个 Envoy worker 各有一份 L1）。
 func serveDebug(config Config) {
-	out := debugResponse{L2Enabled: config.l2 != nil, Note: "L1 statistics belong to the Envoy worker that served this request"}
+	out := debugResponse{L2Enabled: config.l2 != nil, L3Enabled: config.l3 != nil, Note: "L1 statistics belong to the Envoy worker that served this request"}
 	if config.l1 != nil {
 		out.L1Enabled = true
 		out.Policy = string(config.l1.Policy())
@@ -383,12 +419,20 @@ type cacheMetrics struct {
 	lookups      proxywasm.MetricCounter
 	hitL1        proxywasm.MetricCounter
 	hitL2        proxywasm.MetricCounter
+	hitL3        proxywasm.MetricCounter
 	misses       proxywasm.MetricCounter
 	bypass       proxywasm.MetricCounter
 	skipped      proxywasm.MetricCounter
 	stores       proxywasm.MetricCounter
 	storeSkipped proxywasm.MetricCounter
 	l2Errors     proxywasm.MetricCounter
+	l3Lookups    proxywasm.MetricCounter
+	l3Stores     proxywasm.MetricCounter
+	l3Errors     proxywasm.MetricCounter
+	l3Rejects    proxywasm.MetricCounter   // 相似度达标但未通过要素校验的候选数
+	l3Stale      proxywasm.MetricCounter   // 向量库里有、L2 中已过期的候选数（随即删除）
+	l3LookupMs   proxywasm.MetricHistogram // 向量化 + 检索耗时：语义缓存给未命中请求增加的首 token 延迟
+	hitLatencyMs proxywasm.MetricHistogram // 命中请求从收到请求头到回放完成的耗时（即命中时的首 token 延迟）
 }
 
 func newCacheMetrics() *cacheMetrics {
@@ -396,11 +440,19 @@ func newCacheMetrics() *cacheMetrics {
 		lookups:      proxywasm.DefineCounterMetric("maas_cache_lookups_total"),
 		hitL1:        proxywasm.DefineCounterMetric("maas_cache_hits_l1_total"),
 		hitL2:        proxywasm.DefineCounterMetric("maas_cache_hits_l2_total"),
+		hitL3:        proxywasm.DefineCounterMetric("maas_cache_hits_l3_total"),
 		misses:       proxywasm.DefineCounterMetric("maas_cache_misses_total"),
 		bypass:       proxywasm.DefineCounterMetric("maas_cache_bypass_total"),
 		skipped:      proxywasm.DefineCounterMetric("maas_cache_skipped_total"),
 		stores:       proxywasm.DefineCounterMetric("maas_cache_stores_total"),
 		storeSkipped: proxywasm.DefineCounterMetric("maas_cache_store_skipped_total"),
 		l2Errors:     proxywasm.DefineCounterMetric("maas_cache_l2_errors_total"),
+		l3Lookups:    proxywasm.DefineCounterMetric("maas_cache_l3_lookups_total"),
+		l3Stores:     proxywasm.DefineCounterMetric("maas_cache_l3_stores_total"),
+		l3Errors:     proxywasm.DefineCounterMetric("maas_cache_l3_errors_total"),
+		l3Rejects:    proxywasm.DefineCounterMetric("maas_cache_l3_rejects_total"),
+		l3Stale:      proxywasm.DefineCounterMetric("maas_cache_l3_stale_total"),
+		l3LookupMs:   proxywasm.DefineHistogramMetric("maas_cache_l3_lookup_ms"),
+		hitLatencyMs: proxywasm.DefineHistogramMetric("maas_cache_hit_latency_ms"),
 	}
 }
