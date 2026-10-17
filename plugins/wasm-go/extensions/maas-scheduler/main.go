@@ -49,6 +49,8 @@ const (
 	reasonRejected        = "rejected"
 	reasonColdSpill       = "cold_spill" // 选中的副本已有冷 prefill，换到有空闲名额的副本
 
+	predictedOutputHeader = "x-maas-predicted-output-tokens"
+
 	// 请求在网关排队的原因（响应头 x-maas-wait-reason）
 	waitKVWatermark = "kv_watermark"
 	waitCoalesce    = "coalesce"  // 等同一长前缀的冷 prefill 产出首 token
@@ -74,6 +76,7 @@ type requestState struct {
 	pendingTokens   int64
 	probe           bool
 	waitReason      string
+	routerOutput    int    // maas-router 给出的输出长度预测（x-maas-predicted-output-tokens）
 	coldSlot        bool   // 占用了所选副本的一个冷 prefill 名额（首 token 到达时归还）
 	warmingHash     uint64 // 本请求是该长前缀的冷 prefill 领头者，首 token 到达时清除 warming 标记
 	warmingAddr     string
@@ -113,6 +116,11 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		st.kind = "completion"
 	}
 	ctx.SetContext(ctxStateKey, st)
+	// maas-router 按语义类别估计的输出长度，比按模板的统计更贴近本请求
+	if v, _ := proxywasm.GetHttpRequestHeader(predictedOutputHeader); v != "" {
+		st.routerOutput, _ = strconv.Atoi(v)
+		_ = proxywasm.RemoveHttpRequestHeader(predictedOutputHeader)
+	}
 	if target, _ := proxywasm.GetHttpRequestHeader(config.targetHeader); target != "" {
 		ctx.DontReadRequestBody()
 		_ = proxywasm.RemoveHttpRequestHeader(config.targetHeader)
@@ -150,6 +158,12 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 	if st.policy == PolicyCost {
 		st.features = sched.ExtractFeatures(gjson.ParseBytes(body), st.kind, config.blockTokens, config.tailTokens)
 		st.predictedOutput = config.state.predictor.Predict(st.features.TemplateKey, st.features.MaxTokens)
+		if st.routerOutput > 0 {
+			st.predictedOutput = st.routerOutput
+			if st.features.MaxTokens > 0 {
+				st.predictedOutput = min(st.predictedOutput, st.features.MaxTokens)
+			}
+		}
 	}
 	if decide(st, config, true) {
 		return types.ActionContinue
@@ -496,8 +510,11 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config Config, chunk [
 	if st.firstByteAt.IsZero() && len(chunk) > 0 {
 		st.firstByteAt = time.Now()
 		releasePending(st)
+		ttftMs := float64(st.firstByteAt.Sub(st.releasedAt).Microseconds()) / 1000
+		if st.status == 200 {
+			config.metrics.ttftMs.Record(uint64(ttftMs))
+		}
 		if st.policy == PolicyCost && st.status == 200 {
-			ttftMs := float64(st.firstByteAt.Sub(st.releasedAt).Microseconds()) / 1000
 			config.state.model(st.picked, config.initialModel).Observe(st.decision.PrefillTokens, ttftMs, config.costAlpha)
 		}
 		endColdPrefill(st, config)
@@ -544,6 +561,10 @@ func onHttpStreamDone(ctx wrapper.HttpContext, config Config) {
 	tpotMs := 0.0
 	if !st.firstByteAt.IsZero() && outputTokens > 1 {
 		tpotMs = float64(now.Sub(st.firstByteAt).Microseconds()) / 1000 / float64(outputTokens-1)
+		config.metrics.tpotMs.Record(uint64(tpotMs + 0.5))
+	}
+	if st.queueMs > 0 {
+		config.metrics.queueMs.Record(uint64(st.queueMs))
 	}
 	if config.breakerEnabled {
 		b := config.state.breaker(st.picked)
@@ -734,6 +755,9 @@ type pluginMetrics struct {
 	breakerTrips  proxywasm.MetricCounter
 	probes        proxywasm.MetricCounter
 	invalidations proxywasm.MetricCounter
+	ttftMs        proxywasm.MetricHistogram // 后端首 token 延迟（从转发到首个响应分块，不含网关排队）
+	tpotMs        proxywasm.MetricHistogram
+	queueMs       proxywasm.MetricHistogram // 网关排队时长（合并等待、冷 prefill 名额、显存水位）
 }
 
 func newPluginMetrics() *pluginMetrics {
@@ -751,5 +775,8 @@ func newPluginMetrics() *pluginMetrics {
 		breakerTrips:  proxywasm.DefineCounterMetric("maas_scheduler_breaker_trips_total"),
 		probes:        proxywasm.DefineCounterMetric("maas_scheduler_probes_total"),
 		invalidations: proxywasm.DefineCounterMetric("maas_scheduler_presence_invalidations_total"),
+		ttftMs:        proxywasm.DefineHistogramMetric("maas_scheduler_ttft_ms"),
+		tpotMs:        proxywasm.DefineHistogramMetric("maas_scheduler_tpot_ms"),
+		queueMs:       proxywasm.DefineHistogramMetric("maas_scheduler_queue_ms"),
 	}
 }

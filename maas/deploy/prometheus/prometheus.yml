@@ -1,0 +1,21 @@
+# 采集网关（Envoy 统计 + 三个插件的自定义指标）与各推理副本（vLLM 同名指标）
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    metrics_path: /stats/prometheus
+    static_configs:
+      - targets: ["gateway:9901"]
+
+  - job_name: vllm
+    static_configs:
+      - targets: ["mock-vllm-0:8000", "mock-vllm-1:8000", "mock-vllm-2:8000"]
+        labels: {pool: large}
+      - targets: ["mock-vllm-small:8000"]
+        labels: {pool: small}
+
+  - job_name: qdrant
+    static_configs:
+      - targets: ["qdrant:6333"]

@@ -2,10 +2,11 @@
 
 基于 Higress 二次开发的 MaaS 网关。本目录放部署配置、仿真后端与压测工具；网关插件位于 `plugins/wasm-go/extensions/`：
 
-- [maas-cache](../plugins/wasm-go/extensions/maas-cache/README.md)：多级响应缓存（L1 进程内 W-TinyLFU + L2 Redis），按 vLLM 格式原样回放
+- [maas-cache](../plugins/wasm-go/extensions/maas-cache/README.md)：多级响应缓存（L1 进程内 W-TinyLFU + L2 Redis + L3 语义缓存，L3 带关键要素校验），按 vLLM 格式原样回放
+- [maas-router](../plugins/wasm-go/extensions/maas-router/README.md)：语义分发（长上下文 / 规则 / 向量质心分类，把请求送往大小模型池）
 - [maas-scheduler](../plugins/wasm-go/extensions/maas-scheduler/README.md)：推理副本调度（预测 TTFT 代价模型 + 有界负载一致性哈希前缀亲和 + 显存水位准入与排队 + 慢节点熔断）
 
-请求链路：`client → maas-cache →（未命中）→ maas-scheduler → vLLM 副本`。
+请求链路：`client → maas-cache →（未命中）→ maas-router（选模型池）→ maas-scheduler（选副本）→ vLLM 副本`。
 
 ## 当前进度
 
@@ -22,7 +23,7 @@
 - [x] maas-cache：完整请求规范化缓存键、L1 W-TinyLFU（可切换 LRU 对照）+ L2 Redis、按原始 token 分块回放、流式 / 非流式互转、不可缓存请求过滤、故障放行
 - [x] loadgen 按"网关缓存命中 / 未命中"分组统计，思考模型的 reasoning token 计入首 token
 - [x] 阶段 1 自动验证（`verify_phase1.py`）与压测（`phase1_bench.sh`）
-- [ ] L3 语义缓存、缓存 epoch 失效接口、并发未命中合并（后续）
+- [ ] 缓存 epoch 失效接口、并发未命中合并（后续；L3 语义缓存见阶段 3）
 
 阶段 2（智能路由）：
 
@@ -42,16 +43,29 @@
 - [x] 有界负载上限增加绝对下限 `minCapacity`，修复低负载时亲和失效
 - [x] 自动验证（`verify_cold_prefill.py`）
 
+阶段 3（语义分发、L3 语义缓存、监控）：
+
+- [x] embedder：OpenAI 兼容的向量化服务（bge-small-zh-v1.5 int8 ONNX，单条约 1ms）
+- [x] maas-router：`model=higress/auto` 时按长上下文 / 规则 / 语义类别选择模型池，改写 model 并由 Envoy 按请求头路由；复用缓存插件算好的问题向量；按类别预测输出长度交给调度插件
+- [x] maas-cache L3：按上下文键过滤的向量检索（Qdrant），命中后回放 L2 条目并按精确键写回；数字 / 否定 / 关键词要素校验
+- [x] 语义命中判定的离线评估（101 对标注问题，阈值与要素校验的精确率 / 召回率）
+- [x] Prometheus + Grafana 面板（缓存、调度、副本、语义分发）
+- [x] 阶段 3 自动验证（`verify_phase3.py`）与消融压测（`phase3_bench.sh`）
+
 ## 目录
 
 ```
 maas/
 ├── deploy/
-│   ├── docker-compose.yml   # gateway + mock-vllm×3 + redis（+ loadgen，profile: tools）
-│   ├── envoy.yaml           # 静态 Envoy 配置：网关入口、轮询基线、健康检查与 store_metrics
+│   ├── docker-compose.yml   # gateway + mock-vllm×3 + mock-vllm-small + redis + embedder + qdrant
+│   │                        # + prometheus + grafana（+ loadgen，profile: tools）
+│   ├── envoy.yaml           # 静态 Envoy 配置：网关入口、轮询基线、模型池路由、健康检查与 store_metrics
+│   ├── prometheus/          # 抓取网关插件指标、vLLM /metrics、Qdrant
+│   ├── grafana/             # 数据源与面板（dashboards/maas.json 由 gen_dashboard.py 生成）
 │   └── up.sh                # 编译插件并启动
 ├── tools/
 │   ├── mock-vllm/           # vLLM 模拟器（Python + aiohttp）
+│   ├── embedder/            # 向量化服务（bge-small-zh-v1.5 ONNX，镜像构建时下载模型）
 │   └── loadgen/             # 压测（loadgen.py）、负载生成（workload.py）、对比（compare.py）、
 │                            # 各阶段验证（verify_phase*.py）与压测脚本（phase*_bench.sh）
 └── results/                 # 压测结果（只提交 summary.json）
@@ -69,11 +83,18 @@ cd maas/deploy && ./up.sh
 
 | 端口 | 说明 |
 |---|---|
-| 10000 | 网关入口：maas-cache → maas-scheduler；请求头 `x-maas-cache-bypass: on` 可跳过缓存 |
+| 10000 | 网关入口：maas-cache → maas-router → maas-scheduler；`x-maas-cache-bypass: on` 跳过缓存，`x-maas-semantic-bypass: on` 只跳过 L3 |
 | 10001 | 基线：纯 Envoy 轮询，不加载插件（相当于 K8s Service 直连多副本） |
-| 8001–8003 | 直连 mock-vllm-0/1/2（含 `/admin/*` 故障注入接口） |
+| 8001–8003 | 直连大模型池 mock-vllm-0/1/2（`mock-qwen`，含 `/admin/*` 故障注入接口） |
+| 8004 | 直连小模型池 mock-vllm-small（`mock-qwen-small`，单步耗时约为大模型的 1/3） |
+| 8080 | embedder（`/v1/embeddings`） |
+| 6333 | Qdrant（L3 向量库） |
+| 3000 | Grafana 面板「MaaS 网关」（匿名只读） |
+| 9090 | Prometheus |
 | 9901 | Envoy admin |
 | 6379 | Redis（maas-cache 的 L2） |
+
+embedder 镜像构建时从 Hugging Face 下载模型，国内网络可以设置 `HF_ENDPOINT=https://hf-mirror.com`、`PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` 后再执行 `up.sh`。
 
 验证 store_metrics、OverrideHost、副本下线剔除与慢节点分流：
 
@@ -105,6 +126,13 @@ cd maas/tools/loadgen
 uv run --with aiohttp python verify_cold_prefill.py
 ```
 
+验证语义分发、L3 语义缓存与要素校验、监控面板（`--docker-checks` 会临时停掉 embedder 和 Qdrant）：
+
+```bash
+cd maas/tools/loadgen
+uv run --with aiohttp python verify_phase3.py --docker-checks
+```
+
 压测（每轮开始前清空副本前缀缓存与网关缓存）：
 
 ```bash
@@ -112,6 +140,7 @@ cd maas/tools/loadgen
 PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase0_bench.sh   # 纯轮询 vs 调度插件（绕过缓存）
 PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase1_bench.sh   # 加入缓存后的闭环 / 开环对比，约 18 分钟
 PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase2_bench.sh   # 长上下文 RAG 负载下的调度对比，约 20 分钟
+PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase3_bench.sh   # 客服问答负载下 L3 与语义分发的消融，约 18 分钟
 # 决赛口径：DURATION=600
 ```
 
@@ -274,6 +303,64 @@ v2 的 P99 尾部全部来自 6K 文档的冷 prefill（单次约 0.9s，几个�
 
 冷 prefill 的数量几乎没变（占全部请求的 17.4% → 16.3%，主要来自 KV 驱逐），变化在于它们不再在同一副本上叠加：冷 prefill 的 TTFT P90 从 1562ms 降到 1133ms，加缓存时从 1639ms 降到 1332ms。闭环下 P99 的尾部仍是冷 prefill，要进一步提升需要减少 KV 驱逐本身（后端 KV 卸载或更大的 KV 容量）。
 
+## 阶段 3 结果
+
+### 功能验证（`verify_phase3.py --docker-checks`，全部通过）
+
+| 检查项 | 结果 |
+|---|---|
+| 语义分发 | 寒暄（与类别质心的相似度 0.69）、常见问题（0.62）送小模型池，分析类（0.78）送大模型池；含"Python"的请求按规则、2800 字的长文本按长度送大模型池；响应中的 model 与处理副本都与所选池一致 |
+| 显式指定模型 | 直接送往该模型所在的池；客户端伪造的 `x-maas-pool` 被覆盖 |
+| 向量复用 | 缓存插件在 L3 查找时算出的问题向量被路由插件直接复用，同一请求只向量化一次 |
+| L3 命中 | 「信用卡逾期1天对征信有影响吗？」命中「信用卡逾期一天会影响征信吗？」的缓存（相似度 0.9645）：16 个分块与 usage 都和原响应一致，首字节 21ms（未命中 46ms）；同一说法再问一次直接 L1 命中；非流式请求同样命中 |
+| 要素校验 | 「逾期一年」（相似度 0.948）因数字不同、「不需要交违约金」（0.954）因否定不同被拒绝，照常转发后端 |
+| 精确性 | 不同的问题、不同 system prompt 下的同一个问题都不命中 |
+| 故障放行 | 停掉 embedder：请求照常完成，语义分发回落到默认池（`embed_error`），恢复后自动恢复；停掉 Qdrant：跳过 L3，路由仍复用向量，恢复后 L3 自动恢复。故障期间每个未命中请求要多等外呼超时（embedder 故障时缓存、路由各等 100ms，首字节约 250ms），还没有做连续失败后的快速失败 |
+| 失效候选 | L2 条目被删除后，向量库中对应的点在下一次检索到时被删除，之后的改写问题命中下一个候选 |
+| 监控 | Prometheus 的 6 个抓取目标全部 up；Grafana 面板「MaaS 网关」共 25 个 panel，压测期间所有查询都有数据 |
+
+验证中发现并修复的问题：
+
+- **向量相似不等于答案相同**：bge-small-zh-v1.5 给「逾期一天 / 逾期一年」打 0.948、「需要 / 不需要交违约金」打 0.954，都高于最初的阈值 0.9，会直接返回错误答案。为 L3 增加了关键要素校验（数字、否定、关键词），并用 101 对人工标注的问题对选定阈值：只看相似度时阈值 0.90 的精确率只有 0.37（26 次误命中），提到 0.94 仍有 11 次；加上要素校验后阈值 0.88 零误命中、召回率 0.55。详见 [maas-cache 的说明](../plugins/wasm-go/extensions/maas-cache/README.md#为什么需要要素校验)。
+- **规则误伤**：路由规则里的"证明"本意是数学证明，却把「怎么开具存款证明」这类常见问题送进大模型池，已从规则中去掉。
+- **失效的向量点挡住有效候选**：L2 条目过期后，向量库里的点仍在；如果它相似度最高，后面的改写问题每次都先选中它、读 L2 落空、按未命中处理。改为删除这个点并继续检查下一个候选。
+
+### 压测（`phase3_bench.sh`，客服问答负载，90s + 20s 预热）
+
+负载：50% 热点请求换成银行客服的真实问法（27 个意图：20 个常见问题、3 个寒暄、4 个分析，每个意图两种说法，一半请求再随机加上"请问""你好，""谢谢"之类的客套话；4 个 system prompt），50% 是和前几个阶段相同的新请求（其中 10% 附带 8K token 文档）。热点请求按语义类别限制输出长度（寒暄 32、常见问题 128、分析 256 token）。
+
+| 配置 | 说明 |
+|---|---|
+| direct | 纯 Envoy 轮询直连 3 个大模型副本（10001 端口） |
+| no-dispatch | 网关：L1/L2/L3 缓存 + 调度，请求直接指定大模型，不做语义分发 |
+| exact | 网关：L1/L2 缓存 + 语义分发 + 调度，跳过 L3（`x-maas-semantic-bypass: on`） |
+| semantic | 网关全开：L1/L2/L3 缓存 + 语义分发 + 调度 |
+
+闭环，并发 32：
+
+| 配置 | TTFT P50 / P90 / P99 | TPOT 均值 / P50 | 吞吐 | 网关缓存命中（L1+L2 / L3） | 热点请求命中率 | 热点 TTFT P50 |
+|---|---|---|---|---|---|---|
+| direct | 57 / 80 / 1194 ms | 29.7 / 27.4 ms | 7.02 req/s | — | — | 53.8 ms |
+| no-dispatch | 54 / 80 / 1175 ms | 17.2 / 26.6 ms | 10.55 req/s | 41.5%（22.0% / 19.4%） | 85.9% | 7.9 ms |
+| exact | 35 / 74 / 1166 ms | 15.4 / 10.3 ms | 11.92 req/s | 23.5%（23.5% / —） | 48.5% | 17.8 ms |
+| semantic | **29** / 74 / 1165 ms | **12.6** / 9.9 ms | **13.93** req/s | **43.7%**（24.9% / 18.9%） | **90.6%** | **5.9** ms |
+
+开环，6 req/s：
+
+| 配置 | TTFT P50 / P90 / P99 | TPOT 均值 / P50 | 网关缓存命中（L1+L2 / L3） | 热点请求命中率 | 热点 TTFT P50 / P99 | 新请求 TTFT P50 |
+|---|---|---|---|---|---|---|
+| direct | 52 / 158 / 1194 ms | 28.9 / 26.8 ms | — | — | 47.9 / 873 ms | 57.3 ms |
+| no-dispatch | 57 / 82 / 1178 ms | 16.7 / 25.1 ms | 38.4%（18.1% / 20.3%） | 78.2% | 12.4 / 68.5 ms | 70.0 ms |
+| exact | 38 / 74 / 1167 ms | 15.1 / 10.2 ms | 17.9%（17.9% / —） | 36.5% | 25.8 / 65.6 ms | 61.4 ms |
+| semantic | **33** / 75 / 1171 ms | **12.4** / 9.9 ms | **38.9%**（18.2% / 20.7%） | **79.3%** | **11.8** / 64.0 ms | 62.8 ms |
+
+结论：
+
+- **L3 语义缓存**（exact → semantic）：同一个意图换了说法、加了客套话，精确匹配就失效了。加上 L3 后，热点请求的命中率从 48.5% 升到 90.6%（闭环）、从 36.5% 升到 79.3%（开环），热点请求的 TTFT P50 从 17.8ms 降到 5.9ms（闭环）、从 25.8ms 降到 11.8ms（开环），闭环吞吐提升 16.8%。要素校验在闭环一轮中拒绝了 68 个相似度达标的候选。
+- **L3 的代价**：每个未命中请求都要先做一次向量化 + 检索，压测负载下平均 7.5～8.7ms。开环时后端不忙，这部分延迟就露了出来：新请求（全部未命中）的 TTFT P50 在 no-dispatch 下是 70.0ms，直连是 57.3ms。对 27B 模型、32K 上下文的真实 TTFT（数百毫秒到秒级）来说这点开销不大；如果流量里几乎没有换说法的重复（例如只有逐字重复的请求），可以关掉 L3（`l3.enabled: false`）。
+- **语义分发**（no-dispatch → semantic）：寒暄和常见问题分流到小模型池，大模型池只处理分析类、长文档和新请求。闭环下 TTFT P50 从 54ms 降到 29ms、TPOT P50 从 26.6ms 降到 9.9ms、吞吐提升 32%；开环下 TTFT P50 从 57ms 降到 33ms。这一项多用了一个小模型副本，不是同等硬件下的对比，用来说明分类结果确实把请求送到了合适的池。
+- **P99 TTFT 几乎不变**：四种配置、两种负载模型的 P99 都在 1.17～1.19s。约 5% 的请求是附带 8K token 新文档的冷 prefill，P99 正好落在它们上面，缓存和分发只缩短了不需要冷 prefill 的那部分请求（阶段 2 的冷 prefill 优化针对的是同一文档被反复引用的场景）。热点请求自己的 P99 从直连的 873ms 降到 64～69ms（开环）。
+
 ## mock-vllm
 
 单步耗时模型（毫秒），再乘以故障注入的 `slow_factor` 与全局 `time_scale`：
@@ -305,4 +392,4 @@ python loadgen.py --url http://localhost:10000 --mode open --rate 8 --duration 6
 python compare.py ../../results/base/summary.json ../../results/gw/summary.json
 ```
 
-负载结构由 `workload.py` 生成，可通过参数调整：`--repeat-ratio`（重复请求占比，默认 0.5）、`--hot-pool-size` / `--hot-zipf-s`（热点池大小与偏斜度）、`--num-system-prompts` / `--system-tokens`（共享前缀）、`--long-ratio` / `--long-tokens`（长上下文）、`--max-tokens` / `--ignore-eos`（输出长度）。指标口径与 `vllm bench serve` 一致：TPOT = (E2E − TTFT) / (输出 token 数 − 1)。
+负载结构由 `workload.py` 生成，可通过参数调整：`--repeat-ratio`（重复请求占比，默认 0.5）、`--hot-pool-size` / `--hot-zipf-s`（热点池大小与偏斜度）、`--num-system-prompts` / `--system-tokens`（共享前缀）、`--long-ratio` / `--long-tokens`（长上下文）、`--max-tokens` / `--ignore-eos`（输出长度）、`--question-style faq` / `--decorate-ratio`（热点请求换成银行客服的真实问法，每个意图两种说法，再随机加客套话）、`--model higress/auto`（语义分发）。`--admin http://localhost:9901` 会记录本轮网关插件指标的增量（L3 查找 / 命中 / 校验拒绝、查找耗时、模型池分流）。指标口径与 `vllm bench serve` 一致：TPOT = (E2E − TTFT) / (输出 token 数 − 1)。

@@ -1,0 +1,1468 @@
+{
+  "uid": "maas-gateway",
+  "title": "MaaS 网关",
+  "tags": [
+    "maas"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "editable": true,
+  "panels": [
+    {
+      "type": "row",
+      "title": "总览",
+      "id": 2,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "网关 QPS",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix=\"maas_gateway\"}[1m]))",
+          "legendFormat": "网关 QPS",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "缓存命中率",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "(sum(rate(maas_cache_hits_l1_total[1m])) + sum(rate(maas_cache_hits_l2_total[1m])) + sum(rate(maas_cache_hits_l3_total[1m]))) / clamp_min(sum(rate(maas_cache_lookups_total[1m])), 1e-9)",
+          "legendFormat": "缓存命中率",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "语义缓存命中占比",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_hits_l3_total[1m])) / clamp_min((sum(rate(maas_cache_hits_l1_total[1m])) + sum(rate(maas_cache_hits_l2_total[1m])) + sum(rate(maas_cache_hits_l3_total[1m]))), 1e-9)",
+          "legendFormat": "语义缓存命中占比",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "后端 TTFT P99",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(maas_scheduler_ttft_ms_bucket[1m])) by (le))",
+          "legendFormat": "后端 TTFT P99",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 2000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "TPOT P50",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum(rate(maas_scheduler_tpot_ms_bucket[1m])) by (le))",
+          "legendFormat": "TPOT P50",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "网关排队 P99",
+      "id": 8,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(maas_scheduler_queue_ms_bucket[1m])) by (le))",
+          "legendFormat": "网关排队 P99",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "多级缓存",
+      "id": 9,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "各级缓存命中与未命中（次/秒）",
+      "id": 10,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_hits_l1_total[1m]))",
+          "legendFormat": "L1 进程内",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_hits_l2_total[1m]))",
+          "legendFormat": "L2 Redis",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_hits_l3_total[1m]))",
+          "legendFormat": "L3 语义",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_misses_total[1m]))",
+          "legendFormat": "未命中",
+          "refId": "D",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_bypass_total[1m]))",
+          "legendFormat": "绕过",
+          "refId": "E",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_skipped_total[1m]))",
+          "legendFormat": "不可缓存",
+          "refId": "F",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "命中回放与语义检索耗时",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "L3 耗时是语义缓存给未命中请求额外增加的首 token 延迟",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum(rate(maas_cache_hit_latency_ms_bucket[1m])) by (le))",
+          "legendFormat": "命中回放 P50",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(maas_cache_hit_latency_ms_bucket[1m])) by (le))",
+          "legendFormat": "命中回放 P99",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum(rate(maas_cache_l3_lookup_ms_bucket[1m])) by (le))",
+          "legendFormat": "L3 向量化+检索 P50",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(maas_cache_l3_lookup_ms_bucket[1m])) by (le))",
+          "legendFormat": "L3 向量化+检索 P99",
+          "refId": "D",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "L3 语义缓存（次/秒）",
+      "id": 12,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "要素校验拒绝：相似度达到阈值，但数字、否定或关键词与当前问题不一致的候选",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_l3_lookups_total[1m]))",
+          "legendFormat": "语义查找",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_hits_l3_total[1m]))",
+          "legendFormat": "语义命中",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_l3_rejects_total[1m]))",
+          "legendFormat": "要素校验拒绝的候选",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_l3_stores_total[1m]))",
+          "legendFormat": "登记到向量库",
+          "refId": "D",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_cache_l3_errors_total[1m]))",
+          "legendFormat": "向量化 / 检索失败",
+          "refId": "E",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "智能调度",
+      "id": 13,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "调度决策（次/秒）",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 23
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_prefix_hit_total[1m]))",
+          "legendFormat": "前缀命中持有者",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_affinity_total[1m]))",
+          "legendFormat": "新前缀送往家副本",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_cold_spill_total[1m]))",
+          "legendFormat": "冷 prefill 换副本",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_fallback_total[1m]))",
+          "legendFormat": "回退 Envoy 负载均衡",
+          "refId": "D",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_decisions_total[1m])) - sum(rate(maas_scheduler_prefix_hit_total[1m])) - sum(rate(maas_scheduler_affinity_total[1m])) - sum(rate(maas_scheduler_cold_spill_total[1m]))",
+          "legendFormat": "按代价选择",
+          "refId": "E",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "后端时延（插件观测）",
+      "id": 15,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 23
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum(rate(maas_scheduler_ttft_ms_bucket[1m])) by (le))",
+          "legendFormat": "TTFT P50",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(maas_scheduler_ttft_ms_bucket[1m])) by (le))",
+          "legendFormat": "TTFT P99",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum(rate(maas_scheduler_tpot_ms_bucket[1m])) by (le))",
+          "legendFormat": "TPOT P50",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(maas_scheduler_tpot_ms_bucket[1m])) by (le))",
+          "legendFormat": "TPOT P99",
+          "refId": "D",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "排队与冷 prefill 优化（次/秒）",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_coalesced_total[1m]))",
+          "legendFormat": "冷前缀合并等待",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_cold_wait_total[1m]))",
+          "legendFormat": "等冷 prefill 名额",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_queued_total[1m]))",
+          "legendFormat": "网关排队（全部原因）",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_scheduler_queue_timeout_total[1m]))",
+          "legendFormat": "排队超时",
+          "refId": "D",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "熔断与探测（5 分钟内次数）",
+      "id": 17,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(increase(maas_scheduler_breaker_trips_total[5m]))",
+          "legendFormat": "熔断触发",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(increase(maas_scheduler_probes_total[5m]))",
+          "legendFormat": "半开探测",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(increase(maas_scheduler_presence_invalidations_total[5m]))",
+          "legendFormat": "前缀索引纠错",
+          "refId": "C",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "推理副本（vLLM 指标）",
+      "id": 18,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 39
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "running / waiting",
+      "id": 19,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 40
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum by (instance) (vllm:num_requests_running)",
+          "legendFormat": "{{instance}} running",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum by (instance) (vllm:num_requests_waiting)",
+          "legendFormat": "{{instance}} waiting",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "KV cache 占用（显存水位）",
+      "id": 20,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 40
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "max by (instance) (vllm:kv_cache_usage_perc)",
+          "legendFormat": "{{instance}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "后端前缀缓存命中率",
+      "id": 21,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 40
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum by (instance) (rate(vllm:prefix_cache_hits_total[1m])) / clamp_min(sum by (instance) (rate(vllm:prefix_cache_queries_total[1m])), 1)",
+          "legendFormat": "{{instance}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "生成吞吐（token/秒，按模型池）",
+      "id": 22,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum by (pool) (rate(vllm:generation_tokens_total[1m]))",
+          "legendFormat": "{{pool}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "后端 TTFT P99（vLLM 自身统计，按模型池）",
+      "id": 23,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, pool) (rate(vllm:time_to_first_token_seconds_bucket[1m])))",
+          "legendFormat": "{{pool}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "语义分发",
+      "id": 24,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 56
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "模型池分流（次/秒）",
+      "id": 25,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 57
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_router_pool_small_total[1m]))",
+          "legendFormat": "小模型池",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_router_pool_large_total[1m]))",
+          "legendFormat": "大模型池",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 25,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "分发依据（次/秒）",
+      "id": 26,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "maas-prometheus"
+      },
+      "description": "",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 57
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_router_semantic_total[1m]))",
+          "legendFormat": "语义分类",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_router_rule_total[1m]))",
+          "legendFormat": "规则",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_router_long_prompt_total[1m]))",
+          "legendFormat": "长上下文",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_router_default_total[1m]))",
+          "legendFormat": "默认池",
+          "refId": "D",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_router_explicit_total[1m]))",
+          "legendFormat": "显式指定模型",
+          "refId": "E",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "maas-prometheus"
+          },
+          "expr": "sum(rate(maas_router_embedding_reused_total[1m]))",
+          "legendFormat": "复用缓存插件的向量",
+          "refId": "F",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

@@ -1,11 +1,20 @@
-# MaaS 网关：Higress gateway（静态 envoy.yaml + maas-cache / maas-scheduler 两个 WASM 插件）
-# + 3 个 mock-vllm 副本 + Redis（maas-cache 的 L2）。
+# MaaS 网关：Higress gateway（静态 envoy.yaml + maas-cache / maas-router / maas-scheduler 三个 WASM 插件）
+# + 两个模型池（mock-qwen ×3、mock-qwen-small ×1）+ Redis（L2 缓存）+ embedder 与 Qdrant（L3 语义缓存、语义分发）
+# + Prometheus 与 Grafana（监控面板）。
 #
 #   cd maas/deploy && ./up.sh                  # 构建插件并启动
 #   docker compose run --rm loadgen ...        # 压测工具（profile: tools）
 #
-# 对外端口：10000 网关 / 10001 纯轮询基线 / 8001-8003 直连各副本 / 9901 Envoy admin / 6379 Redis
+# 对外端口：10000 网关 / 10001 纯轮询基线 / 8001-8003 大模型副本 / 8004 小模型副本 / 8080 embedder / 6333 Qdrant
+#           3000 Grafana / 9090 Prometheus / 9901 Envoy admin / 6379 Redis
 name: maas
+
+x-mock-env: &mock-env
+  MOCK_SERVED_MODEL_NAME: ${MODEL_NAME:-mock-qwen}
+  MOCK_TIME_SCALE: ${MOCK_TIME_SCALE:-1.0}
+  MOCK_MAX_NUM_SEQS: ${MOCK_MAX_NUM_SEQS:-128}
+  MOCK_NUM_GPU_BLOCKS: ${MOCK_NUM_GPU_BLOCKS:-8192}
+  MOCK_MAX_NUM_BATCHED_TOKENS: ${MOCK_MAX_NUM_BATCHED_TOKENS:-2048}
 
 x-mock-vllm: &mock-vllm
   build:
@@ -13,12 +22,7 @@ x-mock-vllm: &mock-vllm
     args:
       PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
   image: maas/mock-vllm:dev
-  environment:
-    MOCK_SERVED_MODEL_NAME: ${MODEL_NAME:-mock-qwen}
-    MOCK_TIME_SCALE: ${MOCK_TIME_SCALE:-1.0}
-    MOCK_MAX_NUM_SEQS: ${MOCK_MAX_NUM_SEQS:-128}
-    MOCK_NUM_GPU_BLOCKS: ${MOCK_NUM_GPU_BLOCKS:-8192}
-    MOCK_MAX_NUM_BATCHED_TOKENS: ${MOCK_MAX_NUM_BATCHED_TOKENS:-2048}
+  environment: *mock-env
   restart: unless-stopped
 
 services:
@@ -39,8 +43,9 @@ services:
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
       - ../../plugins/wasm-go/extensions/maas-cache/main.wasm:/etc/envoy/plugins/maas-cache.wasm:ro
+      - ../../plugins/wasm-go/extensions/maas-router/main.wasm:/etc/envoy/plugins/maas-router.wasm:ro
       - ../../plugins/wasm-go/extensions/maas-scheduler/main.wasm:/etc/envoy/plugins/maas-scheduler.wasm:ro
-    depends_on: [mock-vllm-0, mock-vllm-1, mock-vllm-2, redis]
+    depends_on: [mock-vllm-0, mock-vllm-1, mock-vllm-2, mock-vllm-small, redis, embedder, qdrant]
     restart: unless-stopped
 
   mock-vllm-0:
@@ -58,10 +63,59 @@ services:
     hostname: mock-vllm-2
     ports: ["8003:8000"]
 
+  # 小模型池：单副本，解码与 prefill 都约快 3 倍，用于语义分发把简单问题分流过去
+  mock-vllm-small:
+    <<: *mock-vllm
+    hostname: mock-vllm-small
+    environment:
+      <<: *mock-env
+      MOCK_SERVED_MODEL_NAME: mock-qwen-small
+      MOCK_STEP_BASE_MS: "7"
+      MOCK_STEP_PER_SEQ_MS: "0.1"
+      MOCK_PREFILL_PER_TOKEN_MS: "0.04"
+    ports: ["8004:8000"]
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lfu"]
     ports: ["6379:6379"]
+    restart: unless-stopped
+
+  # OpenAI 兼容的向量化服务：bge-small-zh-v1.5（int8 ONNX），镜像构建时下载模型
+  embedder:
+    build:
+      context: ../tools/embedder
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+        HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    image: maas/embedder:dev
+    command: ["--backend", "onnx", "--threads", "2"]
+    ports: ["8080:8080"]
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.2
+    ports: ["6333:6333"]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true" # 本地演示：匿名只读访问，无需登录即可看面板
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/maas.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
     restart: unless-stopped
 
   loadgen:

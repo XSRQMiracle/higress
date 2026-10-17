@@ -26,6 +26,7 @@ type Config struct {
 	l1                  *l1.Cache[*Entry]
 	l1MaxEntryBytes     int
 	l2                  *redisStore
+	l3                  *semanticConfig
 	metrics             *cacheMetrics
 }
 
@@ -135,6 +136,83 @@ func parseConfig(json gjson.Result, c *Config) error {
 	if c.l1 == nil && c.l2 == nil {
 		return errors.New("at least one of l1 and l2 must be enabled")
 	}
+
+	if l3Conf := json.Get("l3"); l3Conf.Exists() && (!l3Conf.Get("enabled").Exists() || l3Conf.Get("enabled").Bool()) {
+		if c.l2 == nil {
+			return errors.New("l3 requires l2: the vector store only maps embeddings to L2 keys")
+		}
+		embed, vector := l3Conf.Get("embedding"), l3Conf.Get("vector")
+		if embed.Get("serviceName").String() == "" || vector.Get("serviceName").String() == "" {
+			return errors.New("l3.embedding.serviceName and l3.vector.serviceName are required")
+		}
+		c.l3 = &semanticConfig{
+			embed: wrapper.NewClusterClient(wrapper.FQDNCluster{
+				FQDN: embed.Get("serviceName").String(), Host: embed.Get("serviceHost").String(), Port: intOr(embed.Get("servicePort"), 80),
+			}),
+			embedPath:    embed.Get("path").String(),
+			embedModel:   embed.Get("model").String(),
+			embedTimeout: uint32(intOr(embed.Get("timeoutMs"), 100)),
+			vector: wrapper.NewClusterClient(wrapper.FQDNCluster{
+				FQDN: vector.Get("serviceName").String(), Host: vector.Get("serviceHost").String(), Port: intOr(vector.Get("servicePort"), 6333),
+			}),
+			collection:       vector.Get("collection").String(),
+			vectorTimeout:    uint32(intOr(vector.Get("timeoutMs"), 100)),
+			threshold:        0.88,
+			candidates:       int(intOr(l3Conf.Get("candidates"), 3)),
+			maxQuestionChars: int(intOr(l3Conf.Get("maxQuestionChars"), 512)),
+			dims:             int(intOr(vector.Get("dims"), 512)),
+			guard:            parseGuard(l3Conf.Get("guard")),
+		}
+		for _, h := range stringList(l3Conf.Get("bypassHeaders"), []string{"x-maas-semantic-bypass"}) {
+			c.l3.bypassHeaders = append(c.l3.bypassHeaders, strings.ToLower(h))
+		}
+		if t := l3Conf.Get("threshold"); t.Exists() {
+			c.l3.threshold = t.Float()
+		}
+		if c.l3.embedPath == "" {
+			c.l3.embedPath = "/v1/embeddings"
+		}
+		if c.l3.collection == "" {
+			c.l3.collection = "maas_semantic_cache"
+		}
+		if c.l3.threshold <= 0 || c.l3.threshold > 1 || c.l3.candidates <= 0 || c.l3.maxQuestionChars <= 0 || c.l3.dims <= 0 {
+			return errors.New("l3.threshold must be within (0, 1]; l3.candidates, l3.maxQuestionChars and l3.vector.dims must be positive")
+		}
+		l3 := c.l3
+		// 根上下文的定时任务：确保向量集合存在（请求结束时发出的外呼会被取消，不能指望在请求里创建）
+		wrapper.RegisterTickFunc(1000, func() { ensureCollection(l3) })
+	}
 	c.metrics = newCacheMetrics()
 	return nil
+}
+
+// parseGuard 解析 L3 的关键要素校验配置（见 guard.go）。数字与否定校验默认开启；
+// keyTerms 的每一项是一个义项：一个词，或一组同义词。"guard": {"enabled": false} 关闭校验。
+func parseGuard(json gjson.Result) *guard {
+	if v := json.Get("enabled"); v.Exists() && !v.Bool() {
+		return nil
+	}
+	g := &guard{numbers: true, negation: true}
+	if v := json.Get("numbers"); v.Exists() {
+		g.numbers = v.Bool()
+	}
+	if v := json.Get("negation"); v.Exists() {
+		g.negation = v.Bool()
+	}
+	for _, sense := range json.Get("keyTerms").Array() {
+		var synonyms []string
+		words := []gjson.Result{sense}
+		if sense.IsArray() {
+			words = sense.Array()
+		}
+		for _, w := range words {
+			if t := strings.ToLower(strings.TrimSpace(w.String())); t != "" {
+				synonyms = append(synonyms, t)
+			}
+		}
+		if len(synonyms) > 0 {
+			g.terms = append(g.terms, synonyms)
+		}
+	}
+	return g
 }
