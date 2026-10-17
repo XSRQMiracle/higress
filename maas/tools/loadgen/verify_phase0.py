@@ -19,6 +19,8 @@ import aiohttp
 # docker-compose 中 mock-vllm-N 的管理端口映射到宿主机 800(N+1)
 _HOST_ADMIN = {"mock-vllm-0": "http://localhost:8001", "mock-vllm-1": "http://localhost:8002", "mock-vllm-2": "http://localhost:8003"}
 _CHAT = {"model": "mock-qwen", "max_tokens": 4, "messages": [{"role": "user", "content": "ping"}]}
+# 这里只验证调度插件：请求内容固定，不绕过缓存的话第二次起都会被 maas-cache 直接回放，到不了副本
+_BYPASS = {"x-maas-cache-bypass": "on"}
 
 
 class Checker:
@@ -37,7 +39,7 @@ async def debug_hosts(session: aiohttp.ClientSession, gateway: str) -> dict:
 
 
 async def chat(session: aiohttp.ClientSession, gateway: str, headers: dict | None = None) -> tuple[int, dict]:
-    async with session.post(f"{gateway}/v1/chat/completions", json=_CHAT, headers=headers or {}) as resp:
+    async with session.post(f"{gateway}/v1/chat/completions", json=_CHAT, headers={**_BYPASS, **(headers or {})}) as resp:
         await resp.read()
         return resp.status, {k.lower(): v for k, v in resp.headers.items()}
 
@@ -66,7 +68,7 @@ async def burst(session: aiohttp.ClientSession, gateway: str, concurrency: int, 
 
     async def worker() -> None:
         while time.monotonic() < deadline:
-            async with session.post(f"{gateway}/v1/chat/completions", json=body) as resp:
+            async with session.post(f"{gateway}/v1/chat/completions", json=body, headers=_BYPASS) as resp:
                 await resp.read()
                 if resp.status == 200:
                     counts[resp.headers.get("x-mock-replica")] += 1
