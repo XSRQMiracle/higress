@@ -1,8 +1,8 @@
 # MaaS 网关（阶段 0）的静态 Envoy 配置，运行在 Higress gateway 镜像内（不依赖 K8s 与控制面）。
 #
 # 端口：
-#   10000  网关入口：maas-cache（多级缓存）→ maas-scheduler（选择推理副本）
-#          带 x-maas-cache-bypass: on 时跳过缓存，相当于只有调度插件的网关
+#   10000  网关入口：maas-cache（多级缓存）→ maas-scheduler（选择推理副本，默认 cost 策略）
+#          消融实验：x-maas-cache-bypass: on 跳过缓存；x-maas-policy: least_waiting|round_robin|cost 临时切换调度策略
 #   10001  对照组：纯 Envoy 轮询、不加载任何插件，相当于"K8s Service 直连多副本"的基线
 #   9901   Envoy admin（/stats、/clusters、/config_dump）
 admin:
@@ -27,7 +27,7 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
                       log_format:
                         text_format_source:
-                          inline_string: "[%START_TIME%] gateway \"%REQ(:METHOD)% %REQ(:PATH)%\" %RESPONSE_CODE% %RESPONSE_FLAGS% cache=%RESP(X-MAAS-CACHE)% upstream=%UPSTREAM_HOST% picked=%RESP(X-MAAS-PICKED)% reason=%RESP(X-MAAS-REASON)% first_byte=%RESPONSE_DURATION%ms total=%DURATION%ms\n"
+                          inline_string: "[%START_TIME%] gateway \"%REQ(:METHOD)% %REQ(:PATH)%\" %RESPONSE_CODE% %RESPONSE_FLAGS% cache=%RESP(X-MAAS-CACHE)% upstream=%UPSTREAM_HOST% picked=%RESP(X-MAAS-PICKED)% reason=%RESP(X-MAAS-REASON)% predicted_ttft=%RESP(X-MAAS-PREDICTED-TTFT-MS)% hit=%RESP(X-MAAS-EXPECTED-HIT-TOKENS)% queue=%RESP(X-MAAS-QUEUE-MS)% first_byte=%RESPONSE_DURATION%ms total=%DURATION%ms\n"
                 route_config:
                   name: maas_gateway_route
                   virtual_hosts:
@@ -78,10 +78,16 @@ static_resources:
                             "@type": type.googleapis.com/google.protobuf.StringValue
                             value: |
                               {
-                                "policy": "least_waiting",
+                                "policy": "cost",
+                                "policyHeader": "x-maas-policy",
                                 "targetHeader": "x-maas-target",
                                 "debugHeaders": true,
-                                "debugPath": "/maas/debug/hosts"
+                                "debugPath": "/maas/debug/hosts",
+                                "prefix": {"blockTokens": 256, "tailTokens": 256, "presenceTTLSeconds": 600},
+                                "affinity": {"virtualNodes": 64, "loadFactor": 1.25, "minTokens": 1024},
+                                "cost": {"baseMs": 30, "msPerToken": 0.12, "decodeMsPerSeq": 0.3},
+                                "admission": {"kvHighWatermark": 0.92, "maxWaiting": 16, "queue": true, "maxQueueMs": 3000, "onTimeout": "best_effort"},
+                                "breaker": {"enabled": true, "slowRatio": 2.5, "errorRate": 0.5, "minSamples": 8, "baseCooldownSeconds": 5, "maxCooldownSeconds": 60}
                               }
                   - name: envoy.filters.http.router
                     typed_config:

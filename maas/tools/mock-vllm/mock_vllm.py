@@ -74,6 +74,7 @@ class FaultConfig:
     hang_rate: float = 0.0  # 请求挂起的概率（流式请求会先发出响应头再挂起）
     hang_seconds: float = 60.0  # 挂起时长
     extra_latency_ms: float = 0.0  # 每个请求进入引擎前的固定额外延迟
+    kv_usage_offset: float = 0.0  # 只叠加到上报的 KV 占用率上，模拟显存被其他负载占用（验证网关的水位准入）
     down: bool = False  # 整机下线：除 /admin/* 外所有接口返回 503，健康检查随之失败
 
     def update(self, patch: dict) -> None:
@@ -93,8 +94,8 @@ class FaultConfig:
                     raise ValueError(f"{key} must be >= 0")
                 value = float(value)
             setattr(candidate, key, value)
-        if not 0 <= candidate.error_rate <= 1 or not 0 <= candidate.hang_rate <= 1:
-            raise ValueError("error_rate and hang_rate must be within [0, 1]")
+        if not 0 <= candidate.error_rate <= 1 or not 0 <= candidate.hang_rate <= 1 or not 0 <= candidate.kv_usage_offset <= 1:
+            raise ValueError("error_rate, hang_rate and kv_usage_offset must be within [0, 1]")
         if candidate.slow_factor <= 0:
             raise ValueError("slow_factor must be > 0")
         for name in types:
@@ -523,7 +524,7 @@ class Engine:
     def render_metrics(self) -> str:
         cfg = self.cfg
         labels = f'engine="0",model_name="{cfg.served_model_name}"'
-        usage = self.pool.usage()
+        usage = min(1.0, self.pool.usage() + self.fault.kv_usage_offset)
         lines = [
             "# HELP vllm:num_requests_running Number of requests in model execution batches.",
             "# TYPE vllm:num_requests_running gauge",

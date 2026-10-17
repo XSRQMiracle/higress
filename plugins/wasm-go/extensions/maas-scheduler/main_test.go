@@ -13,6 +13,7 @@ vllm:num_requests_waiting{engine="0",model_name="mock-qwen"} 2.0
 vllm:num_requests_waiting{engine="1",model_name="mock-qwen"} 1.0
 vllm:gpu_cache_usage_perc{engine="0",model_name="mock-qwen"} 0.5
 vllm:kv_cache_usage_perc{engine="0",model_name="mock-qwen"} 0.25
+vllm:cache_config_info{block_size="16",enable_prefix_caching="True",engine="0",num_gpu_blocks="8192"} 1.0
 mock_replica_info{replica="mock-vllm-1",slow_factor="1.0"} 1.0
 `
 
@@ -45,6 +46,9 @@ func TestParseVLLMMetrics(t *testing.T) {
 	if m.Replica != "mock-vllm-1" {
 		t.Fatalf("replica = %q", m.Replica)
 	}
+	if m.NumGPUBlocks != 8192 || m.BlockSize != 16 {
+		t.Fatalf("cache config = %d blocks x %d", m.NumGPUBlocks, m.BlockSize)
+	}
 }
 
 func TestParseVLLMMetricsLegacyKVAndGarbage(t *testing.T) {
@@ -70,7 +74,7 @@ func TestParseHosts(t *testing.T) {
 	if hosts[0].Address != "10.0.0.1:8000" || hosts[0].Healthy() {
 		t.Fatalf("hosts must be sorted and keep health: %+v", hosts[0])
 	}
-	if !hosts[1].HasMetrics || hosts[1].Replica != "mock-vllm-1" || hosts[1].Waiting != 3 {
+	if !hosts[1].HasMetrics || hosts[1].Replica != "mock-vllm-1" || hosts[1].Waiting != 3 || hosts[1].KVCapacity != 8192*16 {
 		t.Fatalf("metrics not parsed: %+v", hosts[1])
 	}
 	if hosts[2].Health != "Unparsed" {

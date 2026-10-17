@@ -20,6 +20,8 @@ type HostSnapshot struct {
 	Waiting      float64 `json:"waiting"`
 	Running      float64 `json:"running"`
 	KVUsage      float64 `json:"kv_cache_usage"`
+	HasKV        bool    `json:"has_kv"`
+	KVCapacity   int     `json:"kv_capacity_tokens"` // num_gpu_blocks × block_size，0 表示未知
 }
 
 func (h HostSnapshot) Healthy() bool {
@@ -48,6 +50,8 @@ func ParseHosts(raw [][2]string) []HostSnapshot {
 				host.Waiting = parsed.Waiting
 				host.Running = parsed.Running
 				host.KVUsage = parsed.KVUsage
+				host.HasKV = parsed.HasKV
+				host.KVCapacity = parsed.NumGPUBlocks * parsed.BlockSize
 				host.Replica = parsed.Replica
 			}
 		}
@@ -64,7 +68,10 @@ type VLLMMetrics struct {
 	KVUsage  float64
 	HasQueue bool
 	HasKV    bool
-	Replica  string // mock-vllm 特有的 mock_replica_info，便于把地址对应到副本
+	// vllm:cache_config_info 的标签：KV cache 的 block 数与 block 大小，相乘得到容量（token）
+	NumGPUBlocks int
+	BlockSize    int
+	Replica      string // mock-vllm 特有的 mock_replica_info，便于把地址对应到副本
 }
 
 // ParseVLLMMetrics 逐行扫描 Prometheus 文本，只提取需要的几个指标族。
@@ -100,6 +107,9 @@ func ParseVLLMMetrics(text string) VLLMMetrics {
 		case "vllm:gpu_cache_usage_perc": // vLLM V0 / 早期 V1 的旧名称
 			legacyKV = math.Max(legacyKV, value)
 			hasLegacyKV = true
+		case "vllm:cache_config_info":
+			m.NumGPUBlocks, _ = strconv.Atoi(labelValue(labels, "num_gpu_blocks"))
+			m.BlockSize, _ = strconv.Atoi(labelValue(labels, "block_size"))
 		case "mock_replica_info":
 			m.Replica = labelValue(labels, "replica")
 		}

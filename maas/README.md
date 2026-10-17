@@ -3,7 +3,7 @@
 基于 Higress 二次开发的 MaaS 网关。本目录放部署配置、仿真后端与压测工具；网关插件位于 `plugins/wasm-go/extensions/`：
 
 - [maas-cache](../plugins/wasm-go/extensions/maas-cache/README.md)：多级响应缓存（L1 进程内 W-TinyLFU + L2 Redis），按 vLLM 格式原样回放
-- [maas-scheduler](../plugins/wasm-go/extensions/maas-scheduler/README.md)：推理副本调度（当前为能力验证版 + least_waiting 策略）
+- [maas-scheduler](../plugins/wasm-go/extensions/maas-scheduler/README.md)：推理副本调度（预测 TTFT 代价模型 + 有界负载一致性哈希前缀亲和 + 显存水位准入与排队 + 慢节点熔断）
 
 请求链路：`client → maas-cache →（未命中）→ maas-scheduler → vLLM 副本`。
 
@@ -23,6 +23,16 @@
 - [x] loadgen 按"网关缓存命中 / 未命中"分组统计，思考模型的 reasoning token 计入首 token
 - [x] 阶段 1 自动验证（`verify_phase1.py`）与压测（`phase1_bench.sh`）
 - [ ] L3 语义缓存、缓存 epoch 失效接口、并发未命中合并（后续）
+
+阶段 2（智能路由）：
+
+- [x] 分层稳定前缀（模板 / 历史 / 文档头部）与前缀驻留索引，后端实际命中反馈纠错
+- [x] 有界负载一致性哈希：新长前缀确定"家"副本，热点自动顺延
+- [x] 预测 TTFT 代价模型（在线标定 BaseMs / MsPerToken）与按模板的输出长度预测
+- [x] 显存水位准入与网关排队（恢复即放行，超时尽力而为或 429）
+- [x] 慢节点 / 高错误率熔断（TPOT 相对集群中位数，半开探测，冷却时间指数退避）
+- [x] SharedData 进程级在途计数；`x-maas-policy` 请求头切换策略做消融实验
+- [x] 阶段 2 自动验证（`verify_phase2.py`）与长上下文 RAG 压测（`phase2_bench.sh`）
 
 ## 目录
 
@@ -73,12 +83,20 @@ cd maas/tools/loadgen
 uv run --with aiohttp python verify_phase1.py --docker-checks
 ```
 
+验证前缀亲和、有界负载、显存水位准入与排队、慢节点熔断（约 2 分钟，会临时注入故障）：
+
+```bash
+cd maas/tools/loadgen
+uv run --with aiohttp python verify_phase2.py
+```
+
 压测（每轮开始前清空副本前缀缓存与网关缓存）：
 
 ```bash
 cd maas/tools/loadgen
 PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase0_bench.sh   # 纯轮询 vs 调度插件（绕过缓存）
 PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase1_bench.sh   # 加入缓存后的闭环 / 开环对比，约 18 分钟
+PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase2_bench.sh   # 长上下文 RAG 负载下的调度对比，约 20 分钟
 # 决赛口径：DURATION=600
 ```
 
@@ -144,6 +162,61 @@ PY="uv run --quiet --python 3.12 --with aiohttp python" ./phase1_bench.sh   # �
 结论：决赛压测如果按固定 QPS 发请求，缓存已经能拿到高分；如果按固定并发，必须靠阶段 2 的前缀亲和与准入控制降低未命中请求的尾延迟。压测模型需要尽快向出题方确认。
 
 原始数据：`maas/results/phase1/*/summary.json`。
+
+## 阶段 2 结果
+
+### 功能验证（`verify_phase2.py`，全部通过）
+
+| 检查项 | 结果 |
+|---|---|
+| 前缀亲和 | 同一文档、不同问题的 8 个请求全部落到同一副本（首个决策原因 `affinity`），后 7 个的后端前缀命中率 99.1%；对照 least_waiting 分散到 3 个副本，命中率 70.9% |
+| 一致性哈希 | 不同文档分散到全部 3 个副本 |
+| 有界负载 | 同一文档的 30 个并发请求分摊到多个副本（约 13 / 13 / 4），没有全部压到持有者 |
+| 显存水位准入 | 上报 KV 占用 ≥ 95% 的副本，20 个请求中收到 0 个 |
+| 排队 | 所有副本超过水位时请求在网关排队，水位恢复后 1.1–1.6s 放行；一直不恢复则 3s 后尽力而为 |
+| 慢节点熔断 | 变慢 4 倍的副本流量降到 3% 以下，熔断器 open；恢复后经半开探测重新承接约 1/3 的流量 |
+
+### 压测（`phase2_bench.sh`，mock 后端，150s + 30s 预热）
+
+负载：40% 的请求附带 6K token 文档，共 24 篇（约 144K token，超过单个副本 131K token 的 KV 容量），其余同前（50% 热点请求）。这是刻意制造的 KV 压力场景：任何路由策略都无法让每个副本缓存全部文档。
+
+| 负载模型 | 配置 | TTFT P50 / P90 / P99 | TPOT 均值 | 吞吐 | 网关缓存命中 | 后端前缀命中 |
+|---|---|---|---|---|---|---|
+| 闭环，并发 48 | 纯轮询 | 79 / 1107 / 1751 ms | 46.9 ms | 5.10 req/s | — | 53.2% |
+| | least_waiting（绕过缓存） | 75 / 926 / 1470 ms | 47.1 ms | 5.13 req/s | — | 53.0% |
+| | cost（绕过缓存） | 68 / 918 / 1709 ms | 39.3 ms | 6.21 req/s | — | 69.5% |
+| | 缓存 + cost | 57 / 915 / 1695 ms | 25.2 ms | 10.05 req/s | 43.0% | 59.5% |
+| 开环，4 req/s | 纯轮询 | 71 / 1108 / 1715 ms | 40.0 ms | 4.11 req/s | — | 52.7% |
+| | 缓存 + cost | 57 / 900 / 1145 ms | 18.7 ms | 4.19 req/s | 38.7% | 58.5% |
+
+按决赛口径（相对纯轮询基线）：
+
+- **开环**：P99 TTFT 提升 33.2%，平均 TPOT 提升 53.1%，达到"卓越"档。
+- **闭环**：吞吐提升 97%，平均 TPOT 提升 46%，但 P99 TTFT 只提升 3%。
+- **调度算法本身**（cost 对比 least_waiting，都不带缓存）：后端前缀命中率提升 16.5 个百分点，吞吐提升 21%，平均 TPOT 提升 16%，但 P99 TTFT 变差 16%。
+
+### 算法演进（闭环，不带缓存）
+
+| 版本 | 规则 | 后端前缀命中 | 吞吐 | TPOT 均值 | P99 TTFT |
+|---|---|---|---|---|---|
+| v1 | 所有请求按预测代价贪心选择 | 55.6% | 5.25 req/s | 45.9 ms | 1614 ms |
+| **v2（默认）** | 长前缀优先送持有者，超过有界负载才沿环溢出；新前缀一律送家副本 | **69.5%** | **6.21 req/s** | **39.3 ms** | 1709 ms |
+| v3 | v2 + 新前缀的家副本积压过多时按代价放置（`toleranceMs: 300`） | 61.6% | 5.64 req/s | 42.9 ms | 1761 ms |
+
+- **v1 的问题**：持有文档缓存的副本一旦有 prefill 排队，按单个请求算 TTFT 时就不如空闲副本，于是请求被派往别处。结果 24 篇文档中 20 篇缓存在全部 3 个副本上，副本之间互相挤占 KV，文档请求中 57% 是冷 prefill，局部最优导致全局变差。
+- **v2**：负载均衡交给有界负载约束，不再让"持有者正忙"推翻亲和。冷 prefill 占全部请求的比例从 least_waiting 的 27%（v1 为 26%）降到 17%。
+- **v3**：削弱了局部性，没有带来收益，因此默认关闭（`toleranceMs` 保留为可选开关）。
+
+### 已知局限：闭环下的 P99 TTFT
+
+v2 的 P99 尾部全部来自 6K 文档的冷 prefill（单次约 0.9s，几个同时排在一个副本上时更长）。冷 prefill 仍占全部请求的 17%，其中 71% 发生在之前缓存过该文档、但文档已被后端驱逐的副本上。这个负载下文档总量超过 KV 容量，驱逐无法避免。亲和把同一文档的请求集中到一个副本，文档被驱逐后，这些请求的冷 prefill 也集中在同一副本上，所以尾部比分散路由更长。可以继续尝试的方向：
+
+- 合并冷前缀请求：同一前缀正在某副本上冷 prefill 时，让后续请求等它产出首 token 后再转发，变成命中；
+- 按副本限制同时进行的冷 prefill 数量（以 prefill token 为单位的有界负载）；
+- 在后端用 LMCache 等方案把 KV 卸载到 CPU 内存，减少驱逐；
+- 弄清决赛的文档规模：如果 KV 足够容纳热门前缀，冷 prefill 会少得多。
+
+原始数据：`maas/results/phase2/*/summary.json`（`-v1`、`-v3` 为对照版本）。
 
 ## mock-vllm
 

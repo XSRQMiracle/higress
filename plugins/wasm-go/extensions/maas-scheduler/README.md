@@ -1,64 +1,72 @@
 # maas-scheduler
 
-MaaS 网关的推理副本调度插件（赛题七）。当前是**阶段 0 能力验证版**，用来确认后续调度算法依赖的两项 Higress 扩展能力在静态 Envoy 配置下可用：
+MaaS 网关的推理副本调度插件（赛题七，阶段 2）。在同一个 upstream cluster 的多个 vLLM 副本之间选择处理请求的副本，目标是降低首 token 时延（TTFT）的尾部、稳定 TPOT，并在副本过载或变慢时自动规避。
 
-| 能力 | 用途 | 验证方式 |
-|---|---|---|
-| `proxywasm.GetUpstreamHosts()` | 读取当前路由 cluster 中每个副本的健康状态，以及健康检查拉到的 `/metrics` 文本 | `GET /maas/debug/hosts` |
-| `proxywasm.SetUpstreamOverrideHost()` | 绕过 Envoy 自带负载均衡，把请求钉到指定副本 | 请求头 `x-maas-target: <ip:port>` |
+依赖两项 Higress 扩展能力：`proxywasm.GetUpstreamHosts()`（读取每个副本的健康状态与健康检查拉到的 vLLM `/metrics`，需要 `store_metrics: true`）与 `proxywasm.SetUpstreamOverrideHost()`（把请求钉到选中的副本）。
 
-阶段 2 会在此基础上加入预测 TTFT 代价模型、层级前缀一致性哈希（CHWBL）、显存水位准入与慢节点熔断。
+## 决策流程（默认策略 `cost`）
+
+```
+请求体 ──► 特征提取 ──► 过滤 ──► 选择 ──► override ──► 响应观测 ──► 反馈
+          分层前缀       健康      有界负载            首 token     代价模型标定
+          prompt 长度    熔断器    预测代价            TPOT / 错误  熔断器
+          输出长度预测   显存水位  前缀亲和            usage        前缀索引纠错
+                          │                                       输出长度预测
+                          └─ 全部不达标 → 网关排队 → 放行 / 超时尽力而为 / 429
+```
+
+1. **分层稳定前缀**（`sched/features.go`）：模板层（模型 + tools + system）、历史层（最后一条 user 消息之前的轮次）、文档层（最后一条 user 消息里可复用的头部：优先按最后一个空行切分"文档 + 问题"，否则按 block 对齐并留出尾巴）。最后的问题几乎不会被复用，不参与路由键。
+2. **过滤**：
+   - 熔断器（`sched/breaker.go`）：副本 TPOT 的 EWMA 超过集群中位数 `slowRatio` 倍，或错误率 EWMA 超过 `errorRate`，即摘除 `baseCooldown`；冷却后半开、只放行一个探测请求，探测仍慢则冷却时间翻倍。所有副本都被熔断时放行，避免整体不可用。
+   - 显存水位准入（`Admissible`）：KV 占用率达到 `kvHighWatermark`，或按"prompt 全部未命中 + 预测输出长度"估算接收后会撑满 KV（会触发 vLLM 抢占重算）的副本不接收新请求；waiting 队列超过 `maxWaiting` 同理。
+3. **选择**（`sched/select.go`）：
+   - 有界负载：在途请求数达到 ⌈(1+ε)·(总在途+1)/n⌉ 的副本不参与（ε = `loadFactor` − 1）；
+   - 预测代价：`J_i = T̂_i + λ·max(running_i, inflight_i)`，`T̂_i = BaseMs_i + MsPerToken_i·(PendingPrefill_i + PromptTokens − Ĥ_i)`，Ĥ_i 是副本 i 上预计命中的前缀长度（前缀驻留索引给出）；
+   - 长前缀亲和：从最深的长前缀（≥ `minTokens`）开始逐层查找持有该前缀 KV 的未满副本，有就在持有者中选代价最小的（`prefix_hit`）；都没有时用带虚拟节点的一致性哈希把它送到"家"副本，家已满则沿环顺延（`affinity`）。不同 worker、不同网关实例对同一前缀算出相同的家，不需要共享状态。可选的 `toleranceMs` 让家副本 prefill 积压过多时改按代价放置，但长上下文 RAG 压测中它削弱了局部性，默认关闭。
+   - 持有者正忙时也不放弃亲和：贪心地把长前缀请求派往暂时空闲的副本，会让同一份文档在多个副本上重复缓存、互相挤占 KV，冷 prefill 反而更多（第一版实现就踩了这个坑，见 maas/README.md 的阶段 2 结果）。负载均衡交给有界负载约束保证；没有长前缀的请求才完全按预测代价选择。
+4. **排队**：所有健康副本都未通过准入时，请求在网关挂起（每 100ms 以及每个请求结束时重新评估），超过 `maxQueueMs` 后按 `onTimeout` 尽力而为或返回 429。
+5. **反馈**：首个响应分块到达即 TTFT，用于在线标定每个副本的 `BaseMs` / `MsPerToken`；流结束时用 TPOT 与状态码驱动熔断器；usage 中的 `cached_tokens` 远低于预期时，说明 KV 已被驱逐，纠正前缀索引；输出 token 数按模板更新输出长度预测。
+
+在途请求数与待 prefill token 数保存在 proxy-wasm SharedData 中（每个"副本 × 计数类型"一个 key，CAS 更新），所有 Envoy worker 看到同一份负载；前缀索引、代价模型与熔断器是每个 worker 独立维护的。
 
 ## 配置
 
 ```json
 {
-  "policy": "least_waiting",
-  "targetHeader": "x-maas-target",
-  "debugHeaders": true,
-  "debugPath": "/maas/debug/hosts"
+  "policy": "cost",
+  "policyHeader": "x-maas-policy",
+  "prefix": {"blockTokens": 256, "tailTokens": 256, "presenceTTLSeconds": 600, "maxPresenceEntries": 50000},
+  "affinity": {"virtualNodes": 64, "loadFactor": 1.25, "minTokens": 1024, "toleranceMs": -1},
+  "cost": {"baseMs": 30, "msPerToken": 0.12, "decodeMsPerSeq": 0.3, "ewmaAlpha": 0.2},
+  "admission": {"kvHighWatermark": 0.92, "maxWaiting": 16, "queue": true, "maxQueueMs": 3000, "maxQueueLength": 1024, "onTimeout": "best_effort"},
+  "breaker": {"enabled": true, "slowRatio": 2.5, "errorRate": 0.5, "minSamples": 8, "ewmaAlpha": 0.2, "baseCooldownSeconds": 5, "maxCooldownSeconds": 60}
 }
 ```
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `policy` | `least_waiting` | `header`：只处理带 `targetHeader` 的请求，其余交给 Envoy；`round_robin`：插件内轮询；`least_waiting`：依次比较 vLLM waiting 队列、本网关在途请求数、KV cache 占用，全部相同则随机 |
-| `targetHeader` | `x-maas-target` | 任意策略下，带此请求头的请求都会被钉到指定副本（地址不在 cluster 中时回退） |
-| `debugHeaders` | `true` | 在响应中添加 `x-maas-picked`（选中的副本）与 `x-maas-reason`（决策原因） |
-| `debugPath` | `/maas/debug/hosts` | 返回插件看到的副本列表与解析出的指标；置空可关闭 |
+| `policy` | `cost` | `cost`（上述流程）；对照组：`least_waiting`（waiting → 在途数 → KV 占用）、`round_robin`、`header`（只处理 `targetHeader`） |
+| `policyHeader` | 空 | 非空时允许用该请求头临时指定策略，用于在同一个网关上做消融实验 |
+| `targetHeader` | `x-maas-target` | 带此请求头的请求钉到指定副本（调试用） |
+| `prefix.*` | 见上 | 文档层的 block 大小、留出的尾巴长度、前缀索引的 TTL 与容量 |
+| `affinity.*` | 见上 | 一致性哈希虚拟节点数、有界负载系数 1+ε、值得做亲和的最短前缀、新前缀选家的代价容忍度（小于 0 表示总是选家） |
+| `cost.*` | 见上 | 代价模型初值（会在线标定）、λ、EWMA 系数 |
+| `admission.*` | 见上 | 显存水位、waiting 上限、排队开关、最长排队时间、超时动作 `best_effort` / `reject` |
+| `breaker.*` | 见上 | 慢节点倍数、错误率阈值、最少样本数、冷却时间 |
 
-## 依赖的 cluster 配置
+cluster 需要配置访问 `/metrics` 的主动健康检查，并开启 Higress Envoy 扩展字段 `store_metrics`（`HealthCheck` 第 127 号字段）。`no_traffic_interval` 默认 60s，要调到与 `interval` 相同，否则空闲时指标严重滞后。完整示例见 [maas/deploy/envoy.yaml](../../../../maas/deploy/envoy.yaml)。
 
-`least_waiting` 依赖每个副本的 vLLM 指标。cluster 需要配置访问 `/metrics` 的主动健康检查，并开启 Higress Envoy 扩展字段 `store_metrics`（`HealthCheck` 第 127 号字段）：
+## 观测
 
-```yaml
-health_checks:
-  - timeout: 1s
-    interval: 0.5s
-    no_traffic_interval: 0.5s   # 默认 60s，空闲时指标会严重滞后
-    unhealthy_threshold: 2
-    healthy_threshold: 1
-    http_health_check: { path: /metrics }
-    store_metrics: true
-```
-
-完整示例见 [maas/deploy/envoy.yaml](../../../../maas/deploy/envoy.yaml)。
-
-## 实现要点
-
-- **override 的时机**：有请求体的请求在 `onHttpRequestHeaders` 返回 `HeaderStopIteration`，到 body 阶段再选副本。若在请求头阶段直接 Continue，router 会在插件做出选择之前就选定上游主机，override 不再生效。
-- **指标时效**：健康检查指标最多滞后一个检查周期，因此用本网关的实时在途请求数在两次刷新之间纠偏，并对完全相同的候选随机选择，避免同一周期内的请求全部涌向同一副本。
-- **失败放行**：读取副本列表失败、没有健康副本、override 失败时都不拦截请求，交给 cluster 的 `lb_policy` 兜底，原因写入 `x-maas-reason`。
-- **WASM 的 worker 隔离**：每个 Envoy worker 有独立的 VM，轮询计数器与在途请求数只在本 worker 内可见。
-
-## 指标
-
-- `maas_scheduler_decisions_total`：成功 override 的请求数
-- `maas_scheduler_fallback_total`：回退到 Envoy 负载均衡的请求数
+- 响应头（`debugHeaders: true`）：`x-maas-picked`、`x-maas-reason`（`cost` / `prefix_hit` / `affinity` / `best_effort` / `breaker_fail_open` / ……）、`x-maas-predicted-ttft-ms`、`x-maas-expected-hit-tokens`、`x-maas-queue-ms`。
+- `GET /maas/debug/hosts`：各副本的健康状态、vLLM 指标、KV 容量、进程级在途数与待 prefill token、代价模型参数、熔断器状态，以及前缀索引条目数与排队长度。
+- 指标：`maas_scheduler_{decisions,fallback,affinity,prefix_hit,queued,queue_timeout,rejected,breaker_trips,probes,presence_invalidations}_total`。
 
 ## 构建与测试
 
 ```bash
-go test ./...
+go test ./...                 # sched 包覆盖特征提取、一致性哈希、前缀索引、代价模型、熔断器与选择逻辑
 GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o main.wasm .
 ```
+
+端到端验证：`maas/tools/loadgen/verify_phase2.py`。
