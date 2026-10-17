@@ -114,6 +114,19 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(drain(engine), 2)  # 剩余 12 个 token 再分两步 prefill（8 + 4），第二步产出首个 token
         self.assertEqual(seq.num_out, 1)
 
+    def test_long_prefill_stats(self):
+        engine = make_engine(long_prefill_tokens=16, max_num_batched_tokens=8)
+        seqs = [make_seq(engine, list(f"{i}" + "长" * 30), plan_len=1) for i in range(2)]
+        for seq in seqs:
+            engine.submit(seq)
+        engine._advance(engine._schedule())
+        self.assertEqual(engine.long_prefill_inflight, 1)  # 预算只够调度第一个请求
+        drain(engine)
+        self.assertEqual(engine.long_prefill_inflight, 0)
+        self.assertEqual(engine.long_prefill_peak, 2)  # 第一个还没产出首 token 时第二个已被接纳
+        engine.reset_stats()
+        self.assertEqual(engine.long_prefill_peak, 0)
+
     def test_abort_releases_blocks(self):
         engine = make_engine()
         seq = make_seq(engine, list("一二三四五六七八"), plan_len=50)

@@ -78,6 +78,21 @@ func (p *PresenceIndex) AnyHas(level Level, now time.Time) bool {
 	return false
 }
 
+// Holders 返回该层前缀仍然有效的持有者。
+func (p *PresenceIndex) Holders(level Level, now time.Time) []string {
+	e, ok := p.entries[level.Hash]
+	if !ok {
+		return nil
+	}
+	var out []string
+	for addr := range e.seen {
+		if p.fresh(e, addr, now) {
+			out = append(out, addr)
+		}
+	}
+	return out
+}
+
 // Invalidate 在后端反馈的实际命中远低于预期时，删除 addr 上比实际命中更深的各层记录。
 func (p *PresenceIndex) Invalidate(addr string, levels []Level, actualHitTokens int) {
 	for _, level := range levels {

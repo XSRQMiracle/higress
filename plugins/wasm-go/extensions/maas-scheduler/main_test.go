@@ -4,6 +4,8 @@ import (
 	"math/rand"
 	"slices"
 	"testing"
+
+	"github.com/alibaba/higress/plugins/wasm-go/extensions/maas-scheduler/sched"
 )
 
 const sampleMetrics = `# HELP vllm:num_requests_running Number of requests in model execution batches.
@@ -133,5 +135,33 @@ func TestPickLeastWaitingRandomTie(t *testing.T) {
 	}
 	if !seen["a"] || !seen["b"] {
 		t.Fatalf("ties must be broken randomly, saw %v", seen)
+	}
+}
+
+func TestPlacementRoundTrip(t *testing.T) {
+	p := placement{Hash: 0xdeadbeefcafe, Addr: "192.168.1.2:8000", At: 1792000000123, Warming: true}
+	got, ok := decodePlacement(encodePlacement(p))
+	if !ok || got != p {
+		t.Fatalf("round trip = %+v (%v), want %+v", got, ok, p)
+	}
+	if _, ok := decodePlacement([]byte{1, 2, 3}); ok {
+		t.Fatal("truncated records must be rejected")
+	}
+	if placementKey(5) != placementKey(5+placementSlots) {
+		t.Fatal("hashes in the same slot must share a key")
+	}
+}
+
+func TestDeepestLongAndLevelsUpTo(t *testing.T) {
+	levels := []sched.Level{{Name: "template", Hash: 1, Tokens: 800}, {Name: "document", Hash: 2, Tokens: 7000}}
+	long, ok := deepestLong(levels, 1024)
+	if !ok || long.Hash != 2 {
+		t.Fatalf("deepest long level = %+v (%v)", long, ok)
+	}
+	if _, ok := deepestLong(levels[:1], 1024); ok {
+		t.Fatal("a short template alone is not a long prefix")
+	}
+	if got := levelsUpTo(levels, levels[0]); len(got) != 1 {
+		t.Fatalf("levelsUpTo = %+v", got)
 	}
 }

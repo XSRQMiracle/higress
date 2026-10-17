@@ -84,9 +84,10 @@ static_resources:
                                 "debugHeaders": true,
                                 "debugPath": "/maas/debug/hosts",
                                 "prefix": {"blockTokens": 256, "tailTokens": 256, "presenceTTLSeconds": 600},
-                                "affinity": {"virtualNodes": 64, "loadFactor": 1.25, "minTokens": 1024},
+                                "affinity": {"virtualNodes": 64, "loadFactor": 1.25, "minCapacity": 4, "minTokens": 1024},
                                 "cost": {"baseMs": 30, "msPerToken": 0.12, "decodeMsPerSeq": 0.3},
                                 "admission": {"kvHighWatermark": 0.92, "maxWaiting": 16, "queue": true, "maxQueueMs": 3000, "onTimeout": "best_effort"},
+                                "coldPrefill": {"enabled": true, "minTokens": 1024, "maxPerReplica": 1, "coalesce": true, "maxWarmMs": 15000},
                                 "breaker": {"enabled": true, "slowRatio": 2.5, "errorRate": 0.5, "minSamples": 8, "baseCooldownSeconds": 5, "maxCooldownSeconds": 60}
                               }
                   - name: envoy.filters.http.router

@@ -21,6 +21,7 @@ type Endpoint struct {
 
 type SelectConfig struct {
 	LoadFactor      float64 // 有界负载系数 1+ε：任一副本的在途请求数不超过 ⌈(1+ε)·平均值⌉
+	MinCapacity     int     // 负载上限的绝对下限：低负载时 ⌈(1+ε)·平均值⌉ 只有 1，会让持有者一有请求就被视为"满"
 	AffinityTokens  int     // 前缀至少这么长才做亲和（短前缀在所有副本上都很快会被缓存，亲和得不偿失）
 	ToleranceMs     float64 // 没有持有者时，家副本的预测代价比最优副本高出不超过该值才选家；小于 0 表示总是选家（默认）
 	DecodeMsPerSeq  float64 // λ：每多一个并发序列，对 decode 速度（以及新请求首 token）的边际代价
@@ -76,7 +77,8 @@ type scored struct {
 
 // Select 在已通过健康、熔断与准入过滤的候选副本中选择一个：
 //
-//  1. 有界负载（CHWBL）：在途请求数已达 ⌈(1+ε)·(总在途+1)/n⌉ 的副本视为"满"，不参与选择（全部满时不限制）；
+//  1. 有界负载（CHWBL）：在途请求数已达 max(⌈(1+ε)·(总在途+1)/n⌉, MinCapacity) 的副本视为"满"，
+//     不参与选择（全部满时不限制）；
 //  2. 长前缀亲和：从最深的长前缀（≥ AffinityTokens）开始逐层查找持有该前缀 KV 的未满副本，找到就在持有者中
 //     选预测代价最小的（prefix_hit）。这里刻意不让"持有者正忙"推翻亲和：贪心地把长前缀请求派往暂时空闲的
 //     副本，会让同一份文档在多个副本上重复缓存、互相挤占 KV，冷 prefill 反而更多。负载均衡由有界负载约束保证。
@@ -93,7 +95,7 @@ func Select(eps []Endpoint, req Features, presence *PresenceIndex, ring *Ring, c
 	for _, e := range eps {
 		total += e.Inflight
 	}
-	capacity := int(math.Ceil(cfg.LoadFactor * float64(total) / float64(len(eps))))
+	capacity := max(int(math.Ceil(cfg.LoadFactor*float64(total)/float64(len(eps)))), cfg.MinCapacity)
 	within := make([]Endpoint, 0, len(eps))
 	for _, e := range eps {
 		if e.Inflight < capacity {

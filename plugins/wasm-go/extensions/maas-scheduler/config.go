@@ -44,10 +44,21 @@ type Config struct {
 	breakerCfg      sched.BreakerConfig
 	queueEnabled    bool
 	maxQueue        time.Duration
+	cold            coldConfig
 	maxQueueLength  int
 	rejectOnTimeout bool
 	state           *schedulerState
 	metrics         *pluginMetrics
+}
+
+// coldConfig 控制冷 prefill（未命中前缀缓存的 prompt 很长的请求）的处理。
+type coldConfig struct {
+	enabled       bool
+	minTokens     int           // 未命中的 prompt token 达到该值即视为冷 prefill
+	maxPerReplica int64         // 每个副本同时进行的冷 prefill 上限，满了就换副本或在网关排队
+	coalesce      bool          // 同一长前缀正在冷 prefill 时，后续请求等它产出首 token 再转发
+	maxWarm       time.Duration // warming 标记的最长有效期，防止异常请求一直挡住后续请求
+	placementTTL  time.Duration // 放置表中已完成记录作为"持有者提示"的有效期
 }
 
 // schedulerState 是本 worker（WASM VM）内的调度状态；在途请求数等需要跨 worker 一致的计数放在 SharedData（见 shared.go）。
@@ -123,6 +134,7 @@ func parseConfig(json gjson.Result, c *Config) error {
 	admission := json.Get("admission")
 	c.selectCfg = sched.SelectConfig{
 		LoadFactor:      floatOr(affinity.Get("loadFactor"), 1.25),
+		MinCapacity:     int(intOr(affinity.Get("minCapacity"), 4)),
 		AffinityTokens:  int(intOr(affinity.Get("minTokens"), 1024)),
 		ToleranceMs:     floatOr(affinity.Get("toleranceMs"), -1),
 		DecodeMsPerSeq:  floatOr(cost.Get("decodeMsPerSeq"), 0.3),
@@ -152,6 +164,19 @@ func parseConfig(json gjson.Result, c *Config) error {
 		return fmt.Errorf("admission.onTimeout must be best_effort or reject, got %q", onTimeout)
 	}
 
+	coldConf := json.Get("coldPrefill")
+	c.cold = coldConfig{
+		enabled:       boolOr(coldConf.Get("enabled"), true),
+		minTokens:     int(intOr(coldConf.Get("minTokens"), 1024)),
+		maxPerReplica: intOr(coldConf.Get("maxPerReplica"), 1),
+		coalesce:      boolOr(coldConf.Get("coalesce"), true),
+		maxWarm:       time.Duration(intOr(coldConf.Get("maxWarmMs"), 15000)) * time.Millisecond,
+		placementTTL:  presenceTTL,
+	}
+	if c.cold.minTokens <= 0 || c.cold.maxPerReplica <= 0 || c.cold.maxWarm <= 0 {
+		return errors.New("coldPrefill.minTokens, maxPerReplica and maxWarmMs must be positive")
+	}
+
 	breaker := json.Get("breaker")
 	c.breakerEnabled = boolOr(breaker.Get("enabled"), true)
 	c.breakerCfg = sched.BreakerConfig{
@@ -174,6 +199,9 @@ func parseConfig(json gjson.Result, c *Config) error {
 		rnd:       rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	c.metrics = newPluginMetrics()
+	if c.cold.enabled {
+		initPlacementSlots()
+	}
 	activeConfig = c
 	if !tickRegistered {
 		// 每 100ms 检查一次排队中的请求：放行有容量的、处理超时的（另外每个请求结束时也会立即检查一次）
@@ -225,8 +253,12 @@ func (s *schedulerState) syncMembers(hosts []HostSnapshot, virtualNodes int) {
 		return
 	}
 	current := map[string]struct{}{}
+	zero := make([]byte, 8)
 	for _, a := range addrs {
 		current[a] = struct{}{}
+		for _, key := range []string{inflightKey(a), prefillKey(a), coldKey(a)} {
+			ensureSharedKey(key, zero)
+		}
 	}
 	if s.ring != nil {
 		for _, old := range s.ring.Members() {

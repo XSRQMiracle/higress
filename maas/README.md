@@ -34,6 +34,14 @@
 - [x] SharedData 进程级在途计数；`x-maas-policy` 请求头切换策略做消融实验
 - [x] 阶段 2 自动验证（`verify_phase2.py`）与长上下文 RAG 压测（`phase2_bench.sh`）
 
+冷 prefill 优化：
+
+- [x] 冷前缀请求合并：同一长前缀正在冷 prefill 时，后续请求等首 token 后作为前缀命中转发（领头者 CAS 竞选，跨 worker 唯一）
+- [x] 按副本限制并发冷 prefill：名额满则换副本，全满则网关排队、迟绑定
+- [x] 进程级长前缀放置表（SharedData 直接映射表），兼作跨 worker 的持有者提示
+- [x] 有界负载上限增加绝对下限 `minCapacity`，修复低负载时亲和失效
+- [x] 自动验证（`verify_cold_prefill.py`）
+
 ## 目录
 
 ```
@@ -88,6 +96,13 @@ uv run --with aiohttp python verify_phase1.py --docker-checks
 ```bash
 cd maas/tools/loadgen
 uv run --with aiohttp python verify_phase2.py
+```
+
+验证冷前缀请求合并与冷 prefill 并发限制：
+
+```bash
+cd maas/tools/loadgen
+uv run --with aiohttp python verify_cold_prefill.py
 ```
 
 压测（每轮开始前清空副本前缀缓存与网关缓存）：
@@ -216,7 +231,48 @@ v2 的 P99 尾部全部来自 6K 文档的冷 prefill（单次约 0.9s，几个�
 - 在后端用 LMCache 等方案把 KV 卸载到 CPU 内存，减少驱逐；
 - 弄清决赛的文档规模：如果 KV 足够容纳热门前缀，冷 prefill 会少得多。
 
-原始数据：`maas/results/phase2/*/summary.json`（`-v1`、`-v3` 为对照版本）。
+前两项已在后续的冷 prefill 优化中实现，见下一节。
+
+原始数据：`maas/results/phase2/*/summary.json`（`-v1`、`-v2`、`-v3` 为对照版本；不带后缀的是加入冷 prefill 优化后的结果，见下一节）。
+
+## 冷 prefill 优化结果
+
+针对阶段 2 遗留的"固定并发下 P99 TTFT 被冷 prefill 拖住"的问题。
+
+### 功能验证（`verify_cold_prefill.py`，连续两次全部通过）
+
+| 检查项 | 结果 |
+|---|---|
+| 冷前缀请求合并 | 同一新文档的 4 个并发请求，后端只冷 prefill 一次。3 个跟随者在网关等领头者产出首 token（约 420ms），然后全部落到同一副本并命中前缀（未命中只剩 27 token），TTFT 约 490ms；不合并时它们会各自重新 prefill，TTFT 约 880ms |
+| 冷 prefill 并发限制 | 6 篇新文档同时到达：每个副本同时最多 1 个长 prefill（mock 记录的峰值为 1），3 个请求在网关等名额或被换到空闲副本；对照组 least_waiting 每个副本峰值为 2 |
+| 普通请求不受影响 | 同时发出的 5 个短请求都无需排队 |
+| 名额归还 | 请求结束后各副本的冷 prefill 计数全部回到 0 |
+
+验证过程中修复了两个问题：
+- **两个领头者**：最初 4 个请求里出现了 2 个领头者。proxy-wasm 对不存在的键返回的 CAS 版本号是 0，以 0 写入不做校验，两个 worker 同时首次写入同一个键时都能成功。改为在插件启动时预先创建所有槽位和计数器。
+- **低负载时亲和失效**：有界负载上限 ⌈(1+ε)·(在途+1)/n⌉ 在低负载时只有 1，持有者一有在途请求就被视为"满"，跟随者被派到别的副本重新冷 prefill。增加了 `minCapacity`（默认 4）作为绝对下限。
+
+### 压测（`phase2_bench.sh`，与阶段 2 相同的长上下文 RAG 负载）
+
+| 负载模型 | 配置 | TTFT P50 / P90 / P99 | TPOT 均值 | 吞吐 | 后端前缀命中 |
+|---|---|---|---|---|---|
+| 闭环，并发 48 | 纯轮询 | 79 / 1107 / 1751 ms | 46.9 ms | 5.10 req/s | 53.2% |
+| | least_waiting（绕过缓存） | 75 / 926 / 1470 ms | 47.1 ms | 5.13 req/s | 53.0% |
+| | cost，阶段 2（v2） | 68 / 918 / 1709 ms | 39.3 ms | 6.21 req/s | 69.5% |
+| | cost + 冷 prefill 优化 | 71 / 919 / **1483** ms | 40.2 ms | 6.03 req/s | 70.6% |
+| | 缓存 + cost，阶段 2（v2） | 57 / 915 / 1695 ms | 25.2 ms | 10.05 req/s | 59.5% |
+| | 缓存 + cost + 冷 prefill 优化 | 57 / 901 / **1413** ms | **23.5** ms | **10.88** req/s | 63.9% |
+| 开环，4 req/s | 纯轮询 | 71 / 1108 / 1715 ms | 40.0 ms | 4.11 req/s | 52.7% |
+| | 缓存 + cost，阶段 2（v2） | 57 / 900 / 1145 ms | 18.7 ms | 4.19 req/s | 58.5% |
+| | 缓存 + cost + 冷 prefill 优化 | 57 / 886 / **913** ms | **17.3** ms | 4.19 req/s | 60.0% |
+
+按决赛口径（相对纯轮询基线）：
+
+- **闭环**：P99 TTFT 提升 19.3%（v2 为 3.2%），平均 TPOT 提升 49.9%，吞吐提升 114%，从"未达到基础档"升到"进阶"档；
+- **开环**：P99 TTFT 提升 46.7%（v2 为 33.2%），平均 TPOT 提升 56.8%，保持"卓越"档；
+- **调度算法本身**（cost 对比 least_waiting，都不带缓存）：P99 TTFT 由差 16% 变为持平（−0.9%），TPOT 提升 14.5%，吞吐提升 17.6%。
+
+冷 prefill 的数量几乎没变（占全部请求的 17.4% → 16.3%，主要来自 KV 驱逐），变化在于它们不再在同一副本上叠加：冷 prefill 的 TTFT P90 从 1562ms 降到 1133ms，加缓存时从 1639ms 降到 1332ms。闭环下 P99 的尾部仍是冷 prefill，要进一步提升需要减少 KV 驱逐本身（后端 KV 卸载或更大的 KV 容量）。
 
 ## mock-vllm
 
