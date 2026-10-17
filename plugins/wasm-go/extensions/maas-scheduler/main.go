@@ -47,6 +47,12 @@ const (
 	reasonBestEffort      = "best_effort"
 	reasonBreakerFailOpen = "breaker_fail_open"
 	reasonRejected        = "rejected"
+	reasonColdSpill       = "cold_spill" // 选中的副本已有冷 prefill，换到有空闲名额的副本
+
+	// 请求在网关排队的原因（响应头 x-maas-wait-reason）
+	waitKVWatermark = "kv_watermark"
+	waitCoalesce    = "coalesce"  // 等同一长前缀的冷 prefill 产出首 token
+	waitColdSlot    = "cold_slot" // 所有副本的冷 prefill 名额都已占满
 )
 
 // requestState 记录单个请求从调度到响应结束的全过程。
@@ -67,6 +73,10 @@ type requestState struct {
 	firstByteAt     time.Time
 	pendingTokens   int64
 	probe           bool
+	waitReason      string
+	coldSlot        bool   // 占用了所选副本的一个冷 prefill 名额（首 token 到达时归还）
+	warmingHash     uint64 // 本请求是该长前缀的冷 prefill 领头者，首 token 到达时清除 warming 标记
+	warmingAddr     string
 	status          int
 	events          int
 	tail            []byte
@@ -149,6 +159,12 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 		st.enqueuedAt = time.Now()
 		config.state.queue = append(config.state.queue, st)
 		config.metrics.queued.Increment(1)
+		switch st.waitReason {
+		case waitCoalesce:
+			config.metrics.coalesced.Increment(1)
+		case waitColdSlot:
+			config.metrics.coldWaits.Increment(1)
+		}
 		return types.ActionPause
 	}
 	decide(st, config, false)
@@ -186,6 +202,23 @@ func decide(st *requestState, config Config, admission bool) bool {
 	}
 
 	now := time.Now()
+	long, hasLong := deepestLong(st.features.Levels, config.selectCfg.AffinityTokens)
+	if hasLong && config.cold.enabled {
+		if p, ok := readPlacement(long.Hash); ok {
+			age := time.Duration(now.UnixMilli()-p.At) * time.Millisecond
+			switch {
+			case p.Warming && age < config.cold.maxWarm:
+				// 同一长前缀正在 p.Addr 上冷 prefill：除非本 worker 知道别的副本已经持有它，否则等首 token
+				if admission && config.cold.coalesce && !heldElsewhere(config.state.presence, long, p.Addr, now) {
+					st.waitReason = waitCoalesce
+					return false
+				}
+			case !p.Warming && age < config.cold.placementTTL:
+				// 其他 worker（或本 worker 之前）放置的长前缀：导入本 worker 的前缀索引，让请求找到持有者
+				config.state.presence.Record(p.Addr, levelsUpTo(st.features.Levels, long), time.UnixMilli(p.At))
+			}
+		}
+	}
 	eps, healthy, breakerBlocked := buildEndpoints(st, config, hosts, now, admission, true)
 	reason := ""
 	if len(eps) == 0 && healthy > 0 && breakerBlocked == healthy {
@@ -195,6 +228,7 @@ func decide(st *requestState, config Config, admission bool) bool {
 	}
 	if len(eps) == 0 {
 		if healthy > 0 && admission {
+			st.waitReason = waitKVWatermark
 			return false
 		}
 		fallback(st, config, reasonNoHealthyHost)
@@ -205,13 +239,112 @@ func decide(st *requestState, config Config, admission bool) bool {
 		fallback(st, config, reasonNoHealthyHost)
 		return true
 	}
+
+	// 冷 prefill 并发限制：一个副本同时做多个冷 prefill 不会更快（chunked prefill 共享同一份 token 预算），
+	// 只会让后到的请求排在前面的 prefill 后面。把新的冷 prefill 交给有空闲名额的副本，都满了就在网关排队，
+	// 等任一副本的冷 prefill 产出首 token（迟绑定）。前缀命中的请求不受限制，否则会被迫离开持有者。
+	cold := config.cold.enabled && d.Uncached >= config.cold.minTokens
+	if cold {
+		if admission && reason == "" && d.Reason != sched.ReasonPrefixHit {
+			if !sharedTryAcquire(coldKey(d.Address), config.cold.maxPerReplica) {
+				free := make([]sched.Endpoint, 0, len(eps))
+				for _, e := range eps {
+					if e.Address != d.Address && sharedGet(coldKey(e.Address)) < config.cold.maxPerReplica {
+						free = append(free, e)
+					}
+				}
+				alt, found := sched.Select(free, st.features, config.state.presence, config.state.ring, config.selectCfg, now, config.state.rnd)
+				if !found || !sharedTryAcquire(coldKey(alt.Address), config.cold.maxPerReplica) {
+					st.waitReason = waitColdSlot
+					return false
+				}
+				d = alt
+				d.Reason = reasonColdSpill
+			}
+		} else {
+			sharedAdd(coldKey(d.Address), 1) // 计数但不受上限约束
+		}
+	}
+	// 本请求要在所选副本上冷 prefill 这段长前缀：竞选领头者。另一个 worker 刚刚抢先时，放弃名额改为跟随者
+	warming := hasLong && config.cold.enabled && cold && d.ExpectedHitTokens < long.Tokens
+	claim := warming && admission && config.cold.coalesce
+	if claim && !claimWarming(long.Hash, d.Address, now.UnixMilli(), config.cold.maxWarm) {
+		sharedAdd(coldKey(d.Address), -1)
+		st.waitReason = waitCoalesce
+		return false
+	}
 	if reason != "" {
 		d.Reason = reason
 	} else if !admission {
 		d.Reason = reasonBestEffort
 	}
-	override(st, config, d)
+	if !override(st, config, d) {
+		if cold {
+			sharedAdd(coldKey(d.Address), -1)
+		}
+		if claim {
+			finishWarming(long.Hash, d.Address, now.UnixMilli())
+		}
+		return true
+	}
+	st.coldSlot = cold
+	if hasLong && config.cold.enabled {
+		switch {
+		case warming:
+			if !claim {
+				writePlacement(placement{Hash: long.Hash, Addr: d.Address, At: now.UnixMilli(), Warming: true})
+			}
+			st.warmingHash, st.warmingAddr = long.Hash, d.Address
+		default: // 刷新放置提示，供其他 worker 找到持有者
+			writePlacement(placement{Hash: long.Hash, Addr: d.Address, At: now.UnixMilli()})
+		}
+	}
 	return true
+}
+
+// deepestLong 返回值得做亲和的最深前缀层（各层按深度递增，最深的一层也最长）。
+func deepestLong(levels []sched.Level, minTokens int) (sched.Level, bool) {
+	if n := len(levels); n > 0 && levels[n-1].Tokens >= minTokens {
+		return levels[n-1], true
+	}
+	return sched.Level{}, false
+}
+
+func levelsUpTo(levels []sched.Level, last sched.Level) []sched.Level {
+	for i, l := range levels {
+		if l.Hash == last.Hash {
+			return levels[:i+1]
+		}
+	}
+	return levels
+}
+
+func heldElsewhere(presence *sched.PresenceIndex, level sched.Level, warmingAddr string, now time.Time) bool {
+	for _, addr := range presence.Holders(level, now) {
+		if addr != warmingAddr {
+			return true
+		}
+	}
+	return false
+}
+
+// endColdPrefill 在冷 prefill 产出首 token（或请求结束）时归还名额、清除 warming 标记，
+// 并立即重新评估排队中的请求（合并等待者与等名额的冷 prefill）。
+// processQueue 会切换生效上下文，最后切回当前请求，保证调用方之后的 hostcall 仍作用于它。
+func endColdPrefill(st *requestState, config Config) {
+	if !st.coldSlot && st.warmingHash == 0 {
+		return
+	}
+	if st.coldSlot {
+		sharedAdd(coldKey(st.picked), -1)
+		st.coldSlot = false
+	}
+	if st.warmingHash != 0 {
+		finishWarming(st.warmingHash, st.warmingAddr, time.Now().UnixMilli())
+		st.warmingHash = 0
+	}
+	processQueue(config)
+	st.ctx.Path()
 }
 
 // buildEndpoints 把健康副本转成调度候选，依次经过熔断器与显存水位准入过滤。
@@ -271,10 +404,10 @@ func pickTarget(st *requestState, config Config, target string) {
 	fallback(st, config, reasonTargetNotFound)
 }
 
-func override(st *requestState, config Config, d sched.Decision) {
+func override(st *requestState, config Config, d sched.Decision) bool {
 	if err := proxywasm.SetUpstreamOverrideHost([]byte(d.Address)); err != nil {
 		fallback(st, config, reasonOverrideFailed)
-		return
+		return false
 	}
 	now := time.Now()
 	st.picked, st.reason, st.decision, st.releasedAt = d.Address, d.Reason, d, now
@@ -300,7 +433,10 @@ func override(st *requestState, config Config, d sched.Decision) {
 		config.metrics.affinity.Increment(1)
 	case sched.ReasonPrefixHit:
 		config.metrics.prefixHits.Increment(1)
+	case reasonColdSpill:
+		config.metrics.coldSpills.Increment(1)
 	}
+	return true
 }
 
 // fallback 不做 override，由 Envoy cluster 自身的负载均衡兜底，保证调度插件失效时请求仍可用。
@@ -338,13 +474,15 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config Config) types.Action 
 			_ = proxywasm.AddHttpResponseHeader("x-maas-predicted-ttft-ms", strconv.FormatFloat(st.decision.PredictedTTFTMs, 'f', 1, 64))
 			_ = proxywasm.AddHttpResponseHeader("x-maas-expected-hit-tokens", strconv.Itoa(st.decision.ExpectedHitTokens))
 		}
-		if st.queueMs > 0 {
+		if !st.enqueuedAt.IsZero() {
 			_ = proxywasm.AddHttpResponseHeader("x-maas-queue-ms", strconv.FormatInt(st.queueMs, 10))
+			_ = proxywasm.AddHttpResponseHeader("x-maas-wait-reason", st.waitReason)
 		}
 	}
 	if contentType, _ := proxywasm.GetHttpResponseHeader("content-type"); !strings.Contains(contentType, "text/event-stream") {
 		ctx.DontReadResponseBody() // 非流式响应观测不到首 token，不参与时延标定
 		releasePending(st)
+		endColdPrefill(st, config)
 	}
 	return types.ActionContinue
 }
@@ -362,6 +500,7 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config Config, chunk [
 			ttftMs := float64(st.firstByteAt.Sub(st.releasedAt).Microseconds()) / 1000
 			config.state.model(st.picked, config.initialModel).Observe(st.decision.PrefillTokens, ttftMs, config.costAlpha)
 		}
+		endColdPrefill(st, config)
 	}
 	st.events += bytes.Count(chunk, []byte("data:"))
 	st.tail = append(st.tail, chunk...)
@@ -385,6 +524,14 @@ func onHttpStreamDone(ctx wrapper.HttpContext, config Config) {
 	}
 	releasePending(st)
 	sharedAdd(inflightKey(st.picked), -1)
+	if st.coldSlot { // 未产出首 token 就结束（失败或客户端断开）
+		sharedAdd(coldKey(st.picked), -1)
+		st.coldSlot = false
+	}
+	if st.warmingHash != 0 {
+		finishWarming(st.warmingHash, st.warmingAddr, time.Now().UnixMilli())
+		st.warmingHash = 0
+	}
 	now := time.Now()
 	completion, cached, hasUsage := parseUsage(st.tail)
 	outputTokens := completion
@@ -527,6 +674,7 @@ type hostDebug struct {
 	HostSnapshot
 	GatewayInflight int64            `json:"gateway_inflight"`
 	PendingPrefill  int64            `json:"pending_prefill_tokens"`
+	ColdPrefills    int64            `json:"cold_prefills"`
 	Model           *sched.CostModel `json:"cost_model,omitempty"`
 	Breaker         *breakerDebug    `json:"breaker,omitempty"`
 }
@@ -560,6 +708,7 @@ func serveDebug(config Config) {
 			HostSnapshot:    h,
 			GatewayInflight: sharedGet(inflightKey(h.Address)),
 			PendingPrefill:  sharedGet(prefillKey(h.Address)),
+			ColdPrefills:    sharedGet(coldKey(h.Address)),
 			Model:           state.models[h.Address],
 		}
 		if b, ok := state.breakers[h.Address]; ok {
@@ -576,6 +725,9 @@ type pluginMetrics struct {
 	fallbacks     proxywasm.MetricCounter
 	affinity      proxywasm.MetricCounter
 	prefixHits    proxywasm.MetricCounter
+	coalesced     proxywasm.MetricCounter
+	coldSpills    proxywasm.MetricCounter
+	coldWaits     proxywasm.MetricCounter
 	queued        proxywasm.MetricCounter
 	queueTimeouts proxywasm.MetricCounter
 	rejected      proxywasm.MetricCounter
@@ -590,6 +742,9 @@ func newPluginMetrics() *pluginMetrics {
 		fallbacks:     proxywasm.DefineCounterMetric("maas_scheduler_fallback_total"),
 		affinity:      proxywasm.DefineCounterMetric("maas_scheduler_affinity_total"),
 		prefixHits:    proxywasm.DefineCounterMetric("maas_scheduler_prefix_hit_total"),
+		coalesced:     proxywasm.DefineCounterMetric("maas_scheduler_coalesced_total"),
+		coldSpills:    proxywasm.DefineCounterMetric("maas_scheduler_cold_spill_total"),
+		coldWaits:     proxywasm.DefineCounterMetric("maas_scheduler_cold_wait_total"),
 		queued:        proxywasm.DefineCounterMetric("maas_scheduler_queued_total"),
 		queueTimeouts: proxywasm.DefineCounterMetric("maas_scheduler_queue_timeout_total"),
 		rejected:      proxywasm.DefineCounterMetric("maas_scheduler_rejected_total"),

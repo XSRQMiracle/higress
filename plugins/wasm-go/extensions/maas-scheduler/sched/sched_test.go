@@ -231,7 +231,7 @@ func endpoint(addr string, inflight int) Endpoint {
 	return Endpoint{Address: addr, Inflight: inflight, KVUsage: 0.2, Model: &CostModel{BaseMs: 30, MsPerToken: 0.12}}
 }
 
-var selectCfg = SelectConfig{LoadFactor: 1.25, AffinityTokens: 1024, ToleranceMs: 300, DecodeMsPerSeq: 0.3, KVHighWatermark: 0.9}
+var selectCfg = SelectConfig{LoadFactor: 1.25, MinCapacity: 4, AffinityTokens: 1024, ToleranceMs: 300, DecodeMsPerSeq: 0.3, KVHighWatermark: 0.9}
 
 func docRequest(hash uint64) Features {
 	return Features{
@@ -249,6 +249,23 @@ func TestSelectPrefersReplicaWithCachedPrefix(t *testing.T) {
 	d, ok := Select(eps, req, presence, NewRing([]string{"a", "b", "c"}, 32), selectCfg, now, rand.New(rand.NewSource(1)))
 	if !ok || d.Address != "b" || d.Reason != ReasonPrefixHit || d.ExpectedHitTokens != 8200 || d.Uncached != 100 {
 		t.Fatalf("should pick the replica holding the 8K-token prefix: %+v", d)
+	}
+}
+
+// 低负载时 ⌈(1+ε)·平均值⌉ 只有 1：没有绝对下限的话，持有者只要有一个在途请求就会被视为"满"，亲和失效。
+func TestSelectKeepsAffinityAtLowLoad(t *testing.T) {
+	now := time.Unix(0, 0)
+	presence := NewPresenceIndex(time.Hour, 100)
+	req := docRequest(77)
+	presence.Record("b", req.Levels, now)
+	eps := []Endpoint{endpoint("a", 0), endpoint("b", 1), endpoint("c", 0)}
+	if d, _ := Select(eps, req, presence, nil, selectCfg, now, rand.New(rand.NewSource(1))); d.Address != "b" {
+		t.Fatalf("with one request in flight the holder must keep the prefix: %+v", d)
+	}
+	strict := selectCfg
+	strict.MinCapacity = 0
+	if d, _ := Select(eps, req, presence, nil, strict, now, rand.New(rand.NewSource(1))); d.Address == "b" {
+		t.Fatalf("without a minimum capacity the plain CHWBL cap (1) excludes the holder: %+v", d)
 	}
 }
 

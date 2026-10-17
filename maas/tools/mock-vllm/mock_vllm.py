@@ -62,6 +62,8 @@ class EngineConfig:
     output_len_mean: int = 200
     output_len_sigma: float = 0.6
     time_scale: float = 1.0
+    # 未命中前缀缓存的 prompt 达到这么多 token 的请求计为"长 prefill"，用于观测网关的冷 prefill 并发限制
+    long_prefill_tokens: int = 1024
     # True：相同输入（prompt + 采样参数）总是生成相同输出，便于校验缓存回放的正确性。
     # False：temperature > 0 的请求每次输出都不同，更接近真实采样。
     deterministic: bool = True
@@ -295,6 +297,7 @@ class Seq:
     last_token_at: float | None = None
     preemptions: int = 0
     finish_reason: str | None = None
+    long_prefill: bool = False  # 正在进行长 prefill（尚未产出首 token）
 
     @property
     def num_tokens(self) -> int:
@@ -348,6 +351,8 @@ class Engine:
         self.prefix_queries = 0
         self.prefix_hits = 0
         self.num_preemptions = 0
+        self.long_prefill_inflight = 0
+        self.long_prefill_peak = 0
         self.prompt_tokens = 0
         self.generation_tokens = 0
         self.success = {"stop": 0, "length": 0, "abort": 0}
@@ -387,6 +392,7 @@ class Engine:
             seq.blocks = []
         else:
             return
+        self._end_long_prefill(seq)
         seq.state = State.ABORTED
         self.success["abort"] += 1
 
@@ -453,6 +459,10 @@ class Engine:
                 seq.cached_tokens = computed
                 self.prompt_tokens += seq.prompt_len
                 self.h_queue.observe(now - seq.arrival)
+                if seq.prompt_len - computed >= cfg.long_prefill_tokens:
+                    seq.long_prefill = True
+                    self.long_prefill_inflight += 1
+                    self.long_prefill_peak = max(self.long_prefill_peak, self.long_prefill_inflight)
             self.prefix_queries += seq.prompt_len
             self.prefix_hits += computed
             self.running.append(seq)
@@ -479,12 +489,21 @@ class Engine:
             if seq.first_token_at is None:
                 seq.first_token_at = now
                 self.h_ttft.observe(now - seq.arrival)
+                self._end_long_prefill(seq)
             else:
                 self.h_itl.observe(now - seq.last_token_at)
             seq.last_token_at = now
             seq.queue.put_nowait(token)
             if seq.num_out >= seq.plan_len:
                 self._finish(seq, now)
+
+    def _end_long_prefill(self, seq: Seq) -> None:
+        if seq.long_prefill:
+            seq.long_prefill = False
+            self.long_prefill_inflight -= 1
+
+    def reset_stats(self) -> None:
+        self.long_prefill_peak = self.long_prefill_inflight
 
     def _finish(self, seq: Seq, now: float) -> None:
         seq.state = State.FINISHED
@@ -581,6 +600,8 @@ class Engine:
             "cached_blocks": len(self.pool.cached),
             "prefix_cache_hit_rate": round(self.prefix_hits / self.prefix_queries, 4) if self.prefix_queries else None,
             "preemptions": self.num_preemptions,
+            "long_prefill_inflight": self.long_prefill_inflight,
+            "long_prefill_peak": self.long_prefill_peak,
             "evictions": self.pool.evictions,
             "steps": self.steps,
             "requests": dict(self.success),
@@ -826,6 +847,12 @@ async def handle_fault(request: web.Request) -> web.Response:
     return web.json_response(asdict(engine.fault))
 
 
+async def handle_reset_stats(request: web.Request) -> web.Response:
+    engine: Engine = request.app["engine"]
+    engine.reset_stats()
+    return web.json_response({"long_prefill_peak": engine.long_prefill_peak})
+
+
 async def handle_reset_prefix_cache(request: web.Request) -> web.Response:
     dropped = request.app["engine"].pool.reset_prefix_cache()
     return web.json_response({"dropped_blocks": dropped})
@@ -864,6 +891,7 @@ def build_app(cfg: EngineConfig, fault: FaultConfig, seed: int | None) -> web.Ap
     app.router.add_get("/admin/state", handle_state)
     app.router.add_post("/admin/fault", handle_fault)
     app.router.add_post("/admin/reset_prefix_cache", handle_reset_prefix_cache)
+    app.router.add_post("/admin/reset_stats", handle_reset_stats)
     app.router.add_post("/reset_prefix_cache", handle_reset_prefix_cache)
     return app
 
